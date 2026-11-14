@@ -28,10 +28,13 @@ use cosmic::{
         widget::{Tree, Widget},
     },
     iced::{
-        Alignment,
+        Alignment, Animation,
         Event::Mouse,
-        Length, Limits, Padding, Subscription, event,
+        Length, Limits, Padding, Subscription,
+        animation::Easing,
+        event,
         mouse::{self, ScrollDelta},
+        time::Instant,
         widget::{Image, Svg, button, column, row, space, stack},
         window,
     },
@@ -67,6 +70,8 @@ use std::{
 };
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
+/// How long a workspace pill takes to grow or shrink to its new size.
+const PILL_SIZE_ANIMATION: Duration = Duration::from_millis(300);
 const WINDOW_LIST_ICON_SIZE: f32 = 20.0;
 
 /// Mime type of an app icon dragged between workspaces. Only this applet
@@ -719,6 +724,10 @@ struct IcedWorkspacesApplet {
     dragged_icon: Option<AppIconId>,
     /// Workspace under a dragged icon, highlighted as the drop target.
     drop_target: Option<ObjectId>,
+    /// Major-axis size of each workspace pill, animated when it changes.
+    pill_sizes: HashMap<ObjectId, Animation<f32>>,
+    /// Time used to sample the animations, advanced on every frame.
+    now: Instant,
 }
 
 struct AppMetadata {
@@ -1438,6 +1447,58 @@ impl IcedWorkspacesApplet {
         )
     }
 
+    /// Starts an animation for each pill whose size changed since the last update.
+    fn animate_pill_sizes(&mut self) {
+        let targets = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                let apps = self.displayed_apps(w);
+                let icons = display_icons(&apps, self.config.show_one_icon_per_application);
+                (w.handle.id(), self.workspace_button_major_size(&icons))
+            })
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut started = false;
+        self.pill_sizes
+            .retain(|id, _| targets.iter().any(|(target_id, _)| target_id == id));
+        for (id, target) in targets {
+            match self.pill_sizes.get_mut(&id) {
+                Some(size) if size.value() != target => {
+                    size.go_mut(target, now);
+                    started = true;
+                }
+                Some(_) => {}
+                None => {
+                    self.pill_sizes.insert(
+                        id,
+                        Animation::new(target)
+                            .duration(PILL_SIZE_ANIMATION)
+                            .easing(Easing::EaseInOutCubic),
+                    );
+                }
+            }
+        }
+        if started {
+            self.now = now;
+        }
+    }
+
+    /// The pill size to draw now, falling back to `target` when no animation
+    /// tracks it yet.
+    fn pill_major_size(&self, workspace: &Workspace, target: f32) -> f32 {
+        match self.pill_sizes.get(&workspace.handle.id()) {
+            Some(size) if size.value() == target => size.interpolate_with(|v| v, self.now),
+            _ => target,
+        }
+    }
+
+    fn pill_size_animating(&self) -> bool {
+        self.pill_sizes
+            .values()
+            .any(|size| size.is_animating(self.now))
+    }
+
     fn workspace_content_edge_padding(&self, icons: &[WorkspaceIcon<'_>]) -> f32 {
         if icons.is_empty() {
             return 0.0;
@@ -2143,6 +2204,8 @@ impl IcedWorkspacesApplet {
             })
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
+            // A growing pill is narrower than its content until the animation ends.
+            .clip(true)
             .into();
 
         stack![pill_background, pill_content]
@@ -3543,73 +3606,11 @@ enum Message {
     InactivePillBrightness(i8),
     ConfigUpdated(WorkspacesAppletConfig),
     Surface(surface::Action<Message>),
+    AnimationFrame(Instant),
 }
 
-impl cosmic::Application for IcedWorkspacesApplet {
-    type Message = Message;
-    type Executor = cosmic::SingleThreadExecutor;
-    type Flags = ();
-    const APP_ID: &'static str = config::APP_ID;
-
-    fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, app::Task<Self::Message>) {
-        let config_helper = Config::new(config::APP_ID, WorkspacesAppletConfig::VERSION).ok();
-        let mut config = config_helper
-            .as_ref()
-            .map(|helper| {
-                let (config, errors) = WorkspacesAppletConfig::load(helper);
-                for err in errors {
-                    tracing::error!(?err, "failed to load workspaces applet config entry");
-                }
-                config
-            })
-            .unwrap_or_default();
-        config.pill_border_width = pill_border_width(config.pill_border_width);
-        config.pill_spacing_percent = pill_spacing_percent(config.pill_spacing_percent);
-        config.max_visible_icons = visible_icon_limit(config.max_visible_icons);
-        config.inactive_pill_brightness_percent =
-            inactive_pill_brightness_percent(config.inactive_pill_brightness_percent);
-        let mut app = Self {
-            layout: match &core.applet.anchor {
-                PanelAnchor::Left | PanelAnchor::Right => Layout::Column,
-                PanelAnchor::Top | PanelAnchor::Bottom => Layout::Row,
-            },
-            core,
-            workspaces: Vec::new(),
-            toplevels: Vec::new(),
-            output: None,
-            locales: fde::get_languages_from_env(),
-            desktop_entries: Vec::new(),
-            app_metadata: HashMap::new(),
-            workspace_tx: Option::default(),
-            scroll: DiscreteScrollState::default().rate_limit(Some(SCROLL_RATE_LIMIT)),
-            config,
-            config_helper,
-            popup: None,
-            window_list: None,
-            rectangle_tracker: None,
-            icon_rectangles: HashMap::new(),
-            pressed_icon: None,
-            dragged_icon: None,
-            drop_target: None,
-        };
-        app.update_desktop_entries();
-
-        (app, Task::none())
-    }
-
-    fn core(&self) -> &cosmic::app::Core {
-        &self.core
-    }
-
-    fn core_mut(&mut self) -> &mut cosmic::app::Core {
-        &mut self.core
-    }
-
-    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
-        Some(Message::PopupClosed(id))
-    }
-
-    fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
+impl IcedWorkspacesApplet {
+    fn handle_message(&mut self, message: Message) -> app::Task<Message> {
         match message {
             Message::WorkspaceUpdate(msg) => match msg {
                 WorkspacesUpdate::Snapshot(mut snapshot) => {
@@ -3828,8 +3829,84 @@ impl cosmic::Application for IcedWorkspacesApplet {
             Message::Surface(a) => {
                 return surface::surface_task(a);
             }
+            Message::AnimationFrame(at) => {
+                self.now = at;
+            }
         }
         Task::none()
+    }
+}
+
+impl cosmic::Application for IcedWorkspacesApplet {
+    type Message = Message;
+    type Executor = cosmic::SingleThreadExecutor;
+    type Flags = ();
+    const APP_ID: &'static str = config::APP_ID;
+
+    fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, app::Task<Self::Message>) {
+        let config_helper = Config::new(config::APP_ID, WorkspacesAppletConfig::VERSION).ok();
+        let mut config = config_helper
+            .as_ref()
+            .map(|helper| {
+                let (config, errors) = WorkspacesAppletConfig::load(helper);
+                for err in errors {
+                    tracing::error!(?err, "failed to load workspaces applet config entry");
+                }
+                config
+            })
+            .unwrap_or_default();
+        config.pill_border_width = pill_border_width(config.pill_border_width);
+        config.pill_spacing_percent = pill_spacing_percent(config.pill_spacing_percent);
+        config.max_visible_icons = visible_icon_limit(config.max_visible_icons);
+        config.inactive_pill_brightness_percent =
+            inactive_pill_brightness_percent(config.inactive_pill_brightness_percent);
+        let mut app = Self {
+            layout: match &core.applet.anchor {
+                PanelAnchor::Left | PanelAnchor::Right => Layout::Column,
+                PanelAnchor::Top | PanelAnchor::Bottom => Layout::Row,
+            },
+            core,
+            workspaces: Vec::new(),
+            toplevels: Vec::new(),
+            output: None,
+            locales: fde::get_languages_from_env(),
+            desktop_entries: Vec::new(),
+            app_metadata: HashMap::new(),
+            workspace_tx: Option::default(),
+            scroll: DiscreteScrollState::default().rate_limit(Some(SCROLL_RATE_LIMIT)),
+            config,
+            config_helper,
+            popup: None,
+            window_list: None,
+            rectangle_tracker: None,
+            icon_rectangles: HashMap::new(),
+            pressed_icon: None,
+            dragged_icon: None,
+            drop_target: None,
+            pill_sizes: HashMap::new(),
+            now: Instant::now(),
+        };
+        app.update_desktop_entries();
+
+        (app, Task::none())
+    }
+
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
+        Some(Message::PopupClosed(id))
+    }
+
+    fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
+        let task = self.handle_message(message);
+        self.animate_pill_sizes();
+        task
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -3844,7 +3921,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             let active = w.state.contains(ext_workspace_handle_v1::State::Active);
             let apps = self.displayed_apps(w);
             let icons = display_icons(&apps, self.config.show_one_icon_per_application);
-            let major_size = self.workspace_button_major_size(&icons);
+            let major_size = self.pill_major_size(w, self.workspace_button_major_size(&icons));
             let (width, height) = if horizontal {
                 (major_size, suggested_window_size.1.get() as f32)
             } else {
@@ -3949,8 +4026,11 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 _ => None,
             })
         });
+        let frames = self
+            .pill_size_animating()
+            .then(|| window::frames().map(|(_, at)| Message::AnimationFrame(at)));
         Subscription::batch(
-            drag_end.into_iter().chain([
+            drag_end.into_iter().chain(frames).chain([
                 self.core
                     .watch_config::<WorkspacesAppletConfig>(config::APP_ID)
                     .map(|update| {
