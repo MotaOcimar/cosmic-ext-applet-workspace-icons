@@ -40,7 +40,7 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         drop_target: None,
         pill_sizes: HashMap::new(),
         icon_flights: Vec::new(),
-        icon_fades: HashMap::new(),
+        icon_growths: HashMap::new(),
         now: Instant::now(),
     }
 }

@@ -72,9 +72,11 @@ use std::{
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 /// How long a workspace pill takes to grow or shrink to its new size.
 const PILL_SIZE_ANIMATION: Duration = Duration::from_millis(300);
-/// How long an app icon takes to fly to another pill or fade in. It matches
+/// How long an app icon takes to fly to another pill or grow in. It matches
 /// the pill animation, so the icon lands as its pill finishes growing.
 const ICON_ANIMATION: Duration = PILL_SIZE_ANIMATION;
+/// Size a new app icon starts growing from, relative to its full size.
+const NEW_ICON_START_SCALE: f32 = 0.4;
 const WINDOW_LIST_ICON_SIZE: f32 = 20.0;
 
 /// Mime type of an app icon dragged between workspaces. Only this applet
@@ -731,8 +733,9 @@ struct IcedWorkspacesApplet {
     pill_sizes: HashMap<ObjectId, Animation<f32>>,
     /// App icons flying to another pill after their windows moved there.
     icon_flights: Vec<IconFlight>,
-    /// App icons fading in after they appeared without coming from another pill.
-    icon_fades: HashMap<AppIconId, Animation<bool>>,
+    /// App icons growing into place after they appeared without coming from
+    /// another pill.
+    icon_growths: HashMap<AppIconId, Animation<bool>>,
     /// Time used to sample the animations, advanced on every frame.
     now: Instant,
 }
@@ -744,6 +747,21 @@ struct IconFlight {
     /// Where the icon was last drawn in its old pill.
     from: Rectangle,
     progress: Animation<bool>,
+}
+
+/// How much of an app icon shows while it animates into its pill.
+#[derive(Clone, Copy)]
+struct IconReveal {
+    opacity: f32,
+    /// Size of the drawn icon relative to its slot, which keeps its size.
+    scale: f32,
+}
+
+impl IconReveal {
+    const FULL: Self = Self {
+        opacity: 1.0,
+        scale: 1.0,
+    };
 }
 
 struct AppMetadata {
@@ -1528,9 +1546,9 @@ impl IcedWorkspacesApplet {
                 .iter()
                 .any(|flight| flight.progress.is_animating(self.now))
             || self
-                .icon_fades
+                .icon_growths
                 .values()
-                .any(|fade| fade.is_animating(self.now))
+                .any(|growth| growth.is_animating(self.now))
     }
 
     /// Ids of the app icons the pills show, including those past the visible limit.
@@ -1564,7 +1582,7 @@ impl IcedWorkspacesApplet {
     }
 
     /// Animates the icons that appeared since the last snapshot: an icon whose
-    /// windows came from another pill flies from there, any other fades in.
+    /// windows came from another pill flies from there, any other grows in.
     fn animate_new_icons(
         &mut self,
         shown_before: &[AppIconId],
@@ -1594,7 +1612,7 @@ impl IcedWorkspacesApplet {
                         .go(true, now),
                 }),
                 None => {
-                    self.icon_fades.insert(
+                    self.icon_growths.insert(
                         to,
                         Animation::new(false)
                             .duration(ICON_ANIMATION)
@@ -1636,19 +1654,25 @@ impl IcedWorkspacesApplet {
         })
     }
 
-    /// How visible an app icon is in its pill: hidden while it flies there,
-    /// partly visible while it fades in.
-    fn icon_visibility(&self, id: &AppIconId) -> f32 {
+    /// How much of an app icon its pill shows: none while it flies there,
+    /// a smaller icon while it grows in.
+    fn icon_reveal(&self, id: &AppIconId) -> IconReveal {
         if self
             .icon_flights
             .iter()
             .any(|flight| flight.to == *id && flight.progress.is_animating(self.now))
         {
-            return 0.0;
+            return IconReveal {
+                opacity: 0.0,
+                scale: 1.0,
+            };
         }
-        self.icon_fades
+        self.icon_growths
             .get(id)
-            .map_or(1.0, |fade| fade.interpolate(0.0, 1.0, self.now))
+            .map_or(IconReveal::FULL, |growth| IconReveal {
+                opacity: 1.0,
+                scale: growth.interpolate(NEW_ICON_START_SCALE, 1.0, self.now),
+            })
     }
 
     /// The icons in flight, drawn above the pills. The layer is always there,
@@ -1669,11 +1693,18 @@ impl IcedWorkspacesApplet {
                 .unwrap_or(flight.from);
             let t = flight.progress.interpolate(0.0, 1.0, self.now);
             let lerp = |from: f32, to: f32| from + (to - from) * t;
-            let icon = container(self.app_icon(metadata, icon_size, false, false, icon_size, 1.0))
-                .width(Length::Fixed(lerp(flight.from.width, to.width)))
-                .height(Length::Fixed(lerp(flight.from.height, to.height)))
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center);
+            let icon = container(self.app_icon(
+                metadata,
+                icon_size,
+                false,
+                false,
+                icon_size,
+                IconReveal::FULL,
+            ))
+            .width(Length::Fixed(lerp(flight.from.width, to.width)))
+            .height(Length::Fixed(lerp(flight.from.height, to.height)))
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center);
             Some(
                 pin(icon)
                     .x(lerp(flight.from.x, to.x))
@@ -1981,7 +2012,7 @@ impl IcedWorkspacesApplet {
                     minimized,
                     false,
                     WINDOW_LIST_ICON_SIZE,
-                    1.0,
+                    IconReveal::FULL,
                 ),
                 text
             ]
@@ -2075,8 +2106,8 @@ impl IcedWorkspacesApplet {
         }
     }
 
-    /// `visibility` scales the icon's opacity, for icons fading in or not
-    /// landed yet.
+    /// `reveal` sets how much of the icon shows while it animates into its
+    /// pill: hidden until a flight lands there, or smaller while it grows in.
     fn app_icon(
         &self,
         metadata: &AppMetadata,
@@ -2084,21 +2115,22 @@ impl IcedWorkspacesApplet {
         dimmed: bool,
         maximized: bool,
         slot_size: f32,
-        visibility: f32,
+        reveal: IconReveal,
     ) -> Element<'_, Message> {
-        let opacity = visibility * if dimmed { MINIMIZED_ICON_OPACITY } else { 1.0 };
+        let opacity = reveal.opacity * if dimmed { MINIMIZED_ICON_OPACITY } else { 1.0 };
+        let drawn_size = icon_size * reveal.scale;
         let handle = metadata.icon_source.as_cosmic_icon();
         let symbolic = handle.symbolic;
 
         let icon: Element<'_, Message> = match handle.data {
             cosmic::widget::icon::Data::Image(handle) => Image::new(handle)
-                .width(Length::Fixed(icon_size))
-                .height(Length::Fixed(icon_size))
+                .width(Length::Fixed(drawn_size))
+                .height(Length::Fixed(drawn_size))
                 .opacity(opacity)
                 .into(),
             cosmic::widget::icon::Data::Svg(handle) => Svg::<Theme>::new(handle)
-                .width(Length::Fixed(icon_size))
-                .height(Length::Fixed(icon_size))
+                .width(Length::Fixed(drawn_size))
+                .height(Length::Fixed(drawn_size))
                 .symbolic(symbolic)
                 .opacity(opacity)
                 .into(),
@@ -2115,7 +2147,7 @@ impl IcedWorkspacesApplet {
                         return container::Style::default();
                     }
                     let glow = Color {
-                        a: MAXIMIZED_ICON_GLOW_OPACITY * visibility,
+                        a: MAXIMIZED_ICON_GLOW_OPACITY * reveal.opacity,
                         ..Color::WHITE
                     };
 
@@ -2128,6 +2160,14 @@ impl IcedWorkspacesApplet {
                         ..Default::default()
                     }
                 })))
+                .into()
+        } else if drawn_size < icon_size {
+            // A growing icon keeps its full slot, so its neighbors stay put.
+            container(icon)
+                .width(Length::Fixed(icon_size))
+                .height(Length::Fixed(icon_size))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
                 .into()
         } else {
             icon
@@ -2168,15 +2208,15 @@ impl IcedWorkspacesApplet {
             .take(visible_icon_count)
             .zip(self.visible_icon_slot_sizes(icons))
             .map(|(icon, slot_size)| {
-                let visibility =
-                    icon_id(workspace, icon).map_or(1.0, |id| self.icon_visibility(&id));
+                let reveal =
+                    icon_id(workspace, icon).map_or(IconReveal::FULL, |id| self.icon_reveal(&id));
                 let element = self.app_icon(
                     icon.metadata,
                     icon_size,
                     icon.in_transit || (self.config.dim_minimized_window_icons && icon.minimized),
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
-                    visibility,
+                    reveal,
                 );
                 self.clickable_icon(workspace, icon, element)
             })
@@ -4043,7 +4083,8 @@ impl IcedWorkspacesApplet {
                 self.now = at;
                 self.icon_flights
                     .retain(|flight| flight.progress.is_animating(at));
-                self.icon_fades.retain(|_, fade| fade.is_animating(at));
+                self.icon_growths
+                    .retain(|_, growth| growth.is_animating(at));
             }
         }
         Task::none()
@@ -4098,7 +4139,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             drop_target: None,
             pill_sizes: HashMap::new(),
             icon_flights: Vec::new(),
-            icon_fades: HashMap::new(),
+            icon_growths: HashMap::new(),
             now: Instant::now(),
         };
         app.update_desktop_entries();
