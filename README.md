@@ -24,7 +24,7 @@ number so you can see where windows are at a glance.
 - Group windows from the same app into one icon or show an icon for each window. Set a limit of 1–16 visible icons per workspace, with `+N` for the rest.
 - Dim icons for minimised windows and highlight icons for maximised windows. Hover to see app names and window counts.
 - Click or scroll to switch workspaces, and click the active workspace to open the overview.
-- Optionally, click an app icon to focus its window, or to minimise it if it is already focused. When an icon groups several windows, choose one from a list.
+- Optionally, click an app icon to focus its window, or to minimise it if it is already focused. When an icon groups several windows, choose one from a list. In this mode, each icon shows its own tooltip with the app name and window count.
 
 ## Workspace Numbers
 

@@ -576,7 +576,9 @@ impl<Message> Widget<Message, Theme, cosmic::Renderer> for HoverSwitch<'_, Messa
         );
     }
 
-    // Input goes only to the tree being drawn, so clicks land on what is visible.
+    // Both trees get every event, but only the drawn one sees the cursor: clicks
+    // land on what is visible, and the hidden tree notices that the cursor left
+    // (so a tooltip opened from it closes).
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -588,27 +590,54 @@ impl<Message> Widget<Message, Theme, cosmic::Renderer> for HoverSwitch<'_, Messa
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let child_index = usize::from(cursor.is_over(layout.bounds()));
-        let child_layout = layout
-            .children()
-            .nth(child_index)
-            .expect("hover switch should have normal and hovered layouts");
-        let child = if child_index == 1 {
-            &mut self.hovered
-        } else {
-            &mut self.normal
-        };
-
-        child.as_widget_mut().update(
-            &mut tree.children[child_index],
-            event,
-            child_layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
+        let hovered = cursor.is_over(layout.bounds());
+        let mut layouts = layout.children();
+        let (normal_layout, hovered_layout) = (
+            layouts
+                .next()
+                .expect("hover switch should have a normal layout"),
+            layouts
+                .next()
+                .expect("hover switch should have a hovered layout"),
         );
+        let (normal_cursor, hovered_cursor) = if hovered {
+            (mouse::Cursor::Unavailable, cursor)
+        } else {
+            (cursor, mouse::Cursor::Unavailable)
+        };
+        let (normal_tree, hovered_tree) = tree.children.split_at_mut(1);
+        // The hidden tree goes first, so it closes its tooltip before the drawn
+        // tree opens one in the same shared surface.
+        let mut children = [
+            (
+                &mut self.normal,
+                &mut normal_tree[0],
+                normal_layout,
+                normal_cursor,
+            ),
+            (
+                &mut self.hovered,
+                &mut hovered_tree[0],
+                hovered_layout,
+                hovered_cursor,
+            ),
+        ];
+        if !hovered {
+            children.reverse();
+        }
+
+        for (child, child_tree, child_layout, child_cursor) in children {
+            child.as_widget_mut().update(
+                child_tree,
+                event,
+                child_layout,
+                child_cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
     }
 
     fn mouse_interaction(
@@ -704,6 +733,17 @@ struct IconTarget<'a> {
     app_id: &'a str,
     /// Set when the icon stands for one window instead of all the app's windows.
     window: Option<&'a ExtForeignToplevelHandleV1>,
+    /// Windows behind the icon, shown as "×N" in its tooltip.
+    window_count: usize,
+}
+
+/// The app name, with "×N" when it has more than one window.
+fn app_summary(name: &str, window_count: usize) -> String {
+    if window_count > 1 {
+        format!("{name} ×{window_count}")
+    } else {
+        name.to_owned()
+    }
 }
 
 /// Identifies an app icon across updates, for clicks and popup anchoring.
@@ -765,6 +805,7 @@ fn display_icons<'a>(
                 target: Some(IconTarget {
                     app_id: app.app_id,
                     window: None,
+                    window_count: app.window_count(),
                 }),
             })
             .collect()
@@ -781,6 +822,7 @@ fn display_icons<'a>(
                         target: app.handles.get(index).map(|handle| IconTarget {
                             app_id: app.app_id,
                             window: Some(*handle),
+                            window_count: 1,
                         }),
                     })
             })
@@ -801,13 +843,8 @@ fn workspace_tooltip(apps: &[WorkspaceApp<'_>]) -> String {
     let mut lines = Vec::new();
 
     for app in apps {
-        let window_count = app.window_count();
         let minimized_count = app.minimized_count();
-        let summary = if window_count > 1 {
-            format!("{} ×{window_count}", app.metadata.name)
-        } else {
-            app.metadata.name.clone()
-        };
+        let summary = app_summary(&app.metadata.name, app.window_count());
         if app.all_minimized() {
             lines.push(format!("{summary} (minimised)"));
         } else if minimized_count > 0 {
@@ -1622,14 +1659,15 @@ impl IcedWorkspacesApplet {
     }
 
     /// Lets an icon focus its windows instead of switching workspace, when enabled.
+    /// The icon then gets its own tooltip, like the dock.
     fn clickable_icon<'a>(
         &'a self,
         workspace: &Workspace,
-        target: Option<IconTarget<'_>>,
-        icon: Element<'a, Message>,
+        icon: &WorkspaceIcon<'_>,
+        element: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let Some(target) = target.filter(|_| self.config.focus_windows_from_icons) else {
-            return icon;
+        let Some(target) = icon.target.filter(|_| self.config.focus_windows_from_icons) else {
+            return element;
         };
         let id = AppIconId {
             workspace: workspace.handle.id(),
@@ -1637,7 +1675,14 @@ impl IcedWorkspacesApplet {
             window: target.window.map(Proxy::id),
         };
         // The mouse area captures the press, so the workspace button ignores it.
-        let icon = mouse_area(icon).on_press(Message::AppIconPressed(id.clone()));
+        let element = mouse_area(element).on_press(Message::AppIconPressed(id.clone()));
+        let icon = self.core.applet.applet_tooltip(
+            element,
+            app_summary(&icon.metadata.name, target.window_count),
+            self.popup.is_some() || self.window_list.is_some(),
+            Message::Surface,
+            None,
+        );
         match self.rectangle_tracker.as_ref() {
             Some(tracker) => tracker.container(id, icon).into(),
             None => icon.into(),
@@ -1745,7 +1790,7 @@ impl IcedWorkspacesApplet {
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
                 );
-                self.clickable_icon(workspace, icon.target, element)
+                self.clickable_icon(workspace, icon, element)
             })
             .collect::<Vec<_>>();
         if overflow_count > 0 {
@@ -2001,7 +2046,7 @@ mod tests {
         MIN_PILL_BORDER_WIDTH, PillStyleSelection, Theme, URGENT_FILLED_BORDER_WIDTH,
         WORKSPACE_CONTENT_PADDING, WORKSPACE_CONTENT_SPACING, WORKSPACE_LIST_EDGE_PADDING,
         WindowClick, WorkspaceApp, WorkspaceIndicator, WorkspaceWindowState,
-        app_group_leading_padding, display_icons, inactive_pill_brightness_percent,
+        app_group_leading_padding, app_summary, display_icons, inactive_pill_brightness_percent,
         inactive_pill_color, informative_titles, occupied_number_section_major_size,
         oriented_padding, pill_border_width, pill_spacing_percent,
         should_retain_toplevel_placement, show_empty_workspace_dot, visible_icon_counts,
@@ -2232,6 +2277,13 @@ mod tests {
         let target = icons[0].target.expect("grouped icon target");
         assert_eq!(target.app_id, "browser");
         assert!(target.window.is_none());
+        assert_eq!(target.window_count, 2);
+    }
+
+    #[test]
+    fn summarizes_an_app_with_its_window_count() {
+        assert_eq!(app_summary("Brave", 2), "Brave ×2");
+        assert_eq!(app_summary("COSMIC Terminal", 1), "COSMIC Terminal");
     }
 
     #[test]
@@ -3612,26 +3664,31 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 .padding(0)
                 .class(cosmic::theme::iced::Button::Transparent);
 
-            let workspace_button: Element<'_, Message> = if has_apps {
-                let tooltip = workspace_tooltip(&apps);
-                self.core
-                    .applet
-                    .applet_tooltip(btn, tooltip, false, Message::Surface, None)
-                    .into()
-            } else {
-                let tooltip = if w
-                    .cosmic_state
-                    .contains(zcosmic_workspace_handle_v2::State::Pinned)
-                {
-                    crate::fl!("pinned-empty-workspace", name = w.name.as_str())
+            let workspace_button: Element<'_, Message> =
+                if has_apps && self.config.focus_windows_from_icons {
+                    // Each icon has its own tooltip; tooltips share one surface,
+                    // so the workspace must not add a second one around them.
+                    btn.into()
+                } else if has_apps {
+                    let tooltip = workspace_tooltip(&apps);
+                    self.core
+                        .applet
+                        .applet_tooltip(btn, tooltip, false, Message::Surface, None)
+                        .into()
                 } else {
-                    crate::fl!("empty-workspace", name = w.name.as_str())
+                    let tooltip = if w
+                        .cosmic_state
+                        .contains(zcosmic_workspace_handle_v2::State::Pinned)
+                    {
+                        crate::fl!("pinned-empty-workspace", name = w.name.as_str())
+                    } else {
+                        crate::fl!("empty-workspace", name = w.name.as_str())
+                    };
+                    self.core
+                        .applet
+                        .applet_tooltip(btn, tooltip, false, Message::Surface, None)
+                        .into()
                 };
-                self.core
-                    .applet
-                    .applet_tooltip(btn, tooltip, false, Message::Surface, None)
-                    .into()
-            };
 
             mouse_area(workspace_button)
                 .on_right_press(Message::TogglePopup)
