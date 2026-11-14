@@ -814,6 +814,15 @@ impl IconReveal {
         opacity: 1.0,
         scale: 1.0,
     };
+
+    /// An icon `progress` of the way to its full look (0 gone, 1 full): it
+    /// scales up from `start_scale` and fades in along with it.
+    fn growing(progress: f32, start_scale: f32) -> Self {
+        Self {
+            opacity: progress,
+            scale: start_scale + (1.0 - start_scale) * progress,
+        }
+    }
 }
 
 struct AppMetadata {
@@ -1713,7 +1722,7 @@ impl IcedWorkspacesApplet {
     }
 
     /// How much of an app icon its pill shows: none while it flies there,
-    /// a smaller icon while it grows in.
+    /// a smaller and fainter icon while it grows in.
     fn icon_reveal(&self, id: &AppIconId) -> IconReveal {
         if self
             .icon_flights
@@ -1727,9 +1736,8 @@ impl IcedWorkspacesApplet {
         }
         self.icon_growths
             .get(id)
-            .map_or(IconReveal::FULL, |growth| IconReveal {
-                opacity: 1.0,
-                scale: growth.interpolate(NEW_ICON_START_SCALE, 1.0, self.now),
+            .map_or(IconReveal::FULL, |growth| {
+                IconReveal::growing(growth.interpolate(0.0, 1.0, self.now), NEW_ICON_START_SCALE)
             })
     }
 
@@ -1791,10 +1799,7 @@ impl IcedWorkspacesApplet {
                 shrink.icon.dimmed,
                 false,
                 icon_size,
-                IconReveal {
-                    opacity: 1.0,
-                    scale: shrink.progress.interpolate(1.0, 0.0, self.now),
-                },
+                IconReveal::growing(shrink.progress.interpolate(1.0, 0.0, self.now), 0.0),
             ))
             .width(Length::Fixed(shrink.at.width))
             .height(Length::Fixed(shrink.at.height))
@@ -1994,10 +1999,7 @@ impl IcedWorkspacesApplet {
             icon.dimmed,
             false,
             icon_size,
-            IconReveal {
-                opacity: 1.0,
-                scale: scale.min(1.0),
-            },
+            IconReveal::growing(scale.min(1.0), 0.0),
         ))
         .width(Length::Fixed(width))
         .height(Length::Fixed(height))
