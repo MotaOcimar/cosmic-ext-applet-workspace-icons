@@ -40,6 +40,7 @@ pub struct WorkspacesAppletConfig {
     pub pill_border_width: u8,
     pub pill_spacing_percent: u8,
     pub inactive_pill_brightness_percent: i8,
+    pub focus_windows_from_icons: bool,
 }
 
 impl Default for WorkspacesAppletConfig {
@@ -55,6 +56,7 @@ impl Default for WorkspacesAppletConfig {
             pill_border_width: DEFAULT_PILL_BORDER_WIDTH,
             pill_spacing_percent: 0,
             inactive_pill_brightness_percent: 0,
+            focus_windows_from_icons: false,
         }
     }
 }
@@ -130,6 +132,24 @@ mod tests {
             assert!(errors.is_empty());
             assert_eq!(loaded.show_workspace_numbers, enabled);
         }
+    }
+
+    #[test]
+    fn keeps_workspace_clicks_on_icons_when_loading_old_settings() {
+        let directory = tempfile::tempdir().expect("temporary config directory");
+        let config = Config::with_custom_path(
+            APP_ID,
+            WorkspacesAppletConfig::VERSION,
+            directory.path().to_path_buf(),
+        )
+        .expect("config");
+        config.set("show_workspace_numbers", false).unwrap();
+
+        let (loaded, errors) = WorkspacesAppletConfig::load(&config);
+
+        assert!(errors.is_empty());
+        assert!(!loaded.focus_windows_from_icons);
+        assert!(!loaded.show_workspace_numbers);
     }
 
     #[test]

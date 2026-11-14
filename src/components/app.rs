@@ -6,22 +6,23 @@ use cctk::{
     cosmic_protocols::workspace::v2::client::zcosmic_workspace_handle_v2,
     sctk::reexports::{
         calloop::channel::SyncSender,
-        protocols::ext::workspace::v1::client::ext_workspace_handle_v1::{
-            self, ExtWorkspaceHandleV1,
+        protocols::ext::{
+            foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+            workspace::v1::client::ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1},
         },
     },
     toplevel_info::ToplevelInfo,
-    wayland_client::protocol::wl_output::WlOutput,
+    wayland_client::{Proxy, backend::ObjectId, protocol::wl_output::WlOutput},
     workspace::Workspace,
 };
 use cosmic::{
     Element, Task, Theme, app,
-    applet::{cosmic_panel_config::PanelAnchor, padded_control},
+    applet::{cosmic_panel_config::PanelAnchor, menu_button, padded_control},
     cosmic_config::{Config, CosmicConfigEntry},
     cosmic_theme::palette::{IntoColor, Oklab, Srgb, Srgba},
     desktop::{IconSourceExt, fde},
     iced::core::{
-        Background, Border, Color, Rectangle, Size,
+        Background, Border, Clipboard, Color, Rectangle, Shell, Size,
         layout::{self as iced_layout, Layout as IcedLayout},
         renderer, svg,
         widget::{Tree, Widget},
@@ -37,7 +38,13 @@ use cosmic::{
     scroll::DiscreteScrollState,
     surface, theme,
     theme::Container as ContainerClass,
-    widget::{Id, autosize, container, divider, dropdown::popup_dropdown, mouse_area, toggler},
+    widget::{
+        Id, autosize, container, divider,
+        dropdown::popup_dropdown,
+        mouse_area,
+        rectangle_tracker::{self, RectangleTracker, RectangleUpdate},
+        toggler,
+    },
 };
 
 use crate::{
@@ -60,6 +67,7 @@ use std::{
 };
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
+const WINDOW_LIST_ICON_SIZE: f32 = 20.0;
 
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
@@ -567,6 +575,69 @@ impl<Message> Widget<Message, Theme, cosmic::Renderer> for HoverSwitch<'_, Messa
             viewport,
         );
     }
+
+    // Input goes only to the tree being drawn, so clicks land on what is visible.
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &cosmic::iced::Event,
+        layout: IcedLayout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let child_index = usize::from(cursor.is_over(layout.bounds()));
+        let child_layout = layout
+            .children()
+            .nth(child_index)
+            .expect("hover switch should have normal and hovered layouts");
+        let child = if child_index == 1 {
+            &mut self.hovered
+        } else {
+            &mut self.normal
+        };
+
+        child.as_widget_mut().update(
+            &mut tree.children[child_index],
+            event,
+            child_layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: IcedLayout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        let child_index = usize::from(cursor.is_over(layout.bounds()));
+        let child_layout = layout
+            .children()
+            .nth(child_index)
+            .expect("hover switch should have normal and hovered layouts");
+        let child = if child_index == 1 {
+            &self.hovered
+        } else {
+            &self.normal
+        };
+
+        child.as_widget().mouse_interaction(
+            &tree.children[child_index],
+            child_layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
 }
 
 fn hover_switch<'a, Message: 'a>(
@@ -593,6 +664,10 @@ struct IcedWorkspacesApplet {
     config: WorkspacesAppletConfig,
     config_helper: Option<Config>,
     popup: Option<window::Id>,
+    /// Popup listing the windows behind a grouped app icon.
+    window_list: Option<(window::Id, AppIconId)>,
+    rectangle_tracker: Option<RectangleTracker<AppIconId>>,
+    icon_rectangles: HashMap<AppIconId, Rectangle>,
 }
 
 struct AppMetadata {
@@ -605,6 +680,8 @@ struct WorkspaceApp<'a> {
     metadata: &'a AppMetadata,
     minimized_titles: Vec<&'a str>,
     windows: Vec<WorkspaceWindowState>,
+    /// Window handles, in the same order as `windows`.
+    handles: Vec<&'a ExtForeignToplevelHandleV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -618,6 +695,40 @@ struct WorkspaceIcon<'a> {
     metadata: &'a AppMetadata,
     minimized: bool,
     maximized: bool,
+    /// What a click on the icon acts on, when focusing windows from icons.
+    target: Option<IconTarget<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct IconTarget<'a> {
+    app_id: &'a str,
+    /// Set when the icon stands for one window instead of all the app's windows.
+    window: Option<&'a ExtForeignToplevelHandleV1>,
+}
+
+/// Identifies an app icon across updates, for clicks and popup anchoring.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AppIconId {
+    workspace: ObjectId,
+    app_id: String,
+    window: Option<ObjectId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowClick {
+    Activate,
+    Minimize,
+}
+
+/// Like a taskbar: a click minimizes the focused window and focuses any other.
+fn window_click(state: &HashSet<zcosmic_toplevel_handle_v1::State>) -> WindowClick {
+    if state.contains(&zcosmic_toplevel_handle_v1::State::Activated)
+        && !state.contains(&zcosmic_toplevel_handle_v1::State::Minimized)
+    {
+        WindowClick::Minimize
+    } else {
+        WindowClick::Activate
+    }
 }
 
 impl WorkspaceApp<'_> {
@@ -651,16 +762,27 @@ fn display_icons<'a>(
                 metadata: app.metadata,
                 minimized: app.all_minimized(),
                 maximized: app.has_maximized(),
+                target: Some(IconTarget {
+                    app_id: app.app_id,
+                    window: None,
+                }),
             })
             .collect()
     } else {
         apps.iter()
             .flat_map(|app| {
-                app.windows.iter().map(|window| WorkspaceIcon {
-                    metadata: app.metadata,
-                    minimized: window.minimized,
-                    maximized: window.maximized,
-                })
+                app.windows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, window)| WorkspaceIcon {
+                        metadata: app.metadata,
+                        minimized: window.minimized,
+                        maximized: window.maximized,
+                        target: app.handles.get(index).map(|handle| IconTarget {
+                            app_id: app.app_id,
+                            window: Some(*handle),
+                        }),
+                    })
             })
             .collect()
     }
@@ -1315,16 +1437,42 @@ impl IcedWorkspacesApplet {
         }
     }
 
+    /// Whether a window belongs to this workspace on the panel's output.
+    fn toplevel_is_on(&self, toplevel: &ToplevelInfo, workspace: &Workspace) -> bool {
+        toplevel.workspace.contains(&workspace.handle)
+            && self
+                .output
+                .as_ref()
+                .is_none_or(|output| toplevel.output.contains(output))
+    }
+
+    /// Windows behind an app icon, in panel order.
+    fn icon_windows(&self, id: &AppIconId) -> Vec<&ToplevelInfo> {
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.handle.id() == id.workspace)
+        else {
+            return Vec::new();
+        };
+        self.toplevels
+            .iter()
+            .filter(|toplevel| {
+                toplevel.app_id == id.app_id
+                    && self.toplevel_is_on(toplevel, workspace)
+                    && id
+                        .window
+                        .as_ref()
+                        .is_none_or(|window| toplevel.foreign_toplevel.id() == *window)
+            })
+            .collect()
+    }
+
     fn apps_for_workspace(&self, workspace: &Workspace) -> Vec<WorkspaceApp<'_>> {
         let mut apps = Vec::<WorkspaceApp<'_>>::new();
 
         for toplevel in &self.toplevels {
-            if !toplevel.workspace.contains(&workspace.handle) {
-                continue;
-            }
-            if let Some(output) = self.output.as_ref()
-                && !toplevel.output.contains(output)
-            {
+            if !self.toplevel_is_on(toplevel, workspace) {
                 continue;
             }
             let Some(metadata) = self.app_metadata.get(&toplevel.app_id) else {
@@ -1342,6 +1490,7 @@ impl IcedWorkspacesApplet {
                     minimized,
                     maximized,
                 });
+                app.handles.push(&toplevel.foreign_toplevel);
                 if minimized {
                     app.minimized_titles.push(&toplevel.title);
                 }
@@ -1357,11 +1506,142 @@ impl IcedWorkspacesApplet {
                         minimized,
                         maximized,
                     }],
+                    handles: vec![&toplevel.foreign_toplevel],
                 });
             }
         }
 
         apps
+    }
+
+    fn send_window_click(&mut self, handle: ExtForeignToplevelHandleV1, click: WindowClick) {
+        if let Some(tx) = self.workspace_tx.as_mut() {
+            let _ = tx.try_send(match click {
+                WindowClick::Activate => WorkspaceEvent::ActivateToplevel(handle),
+                WindowClick::Minimize => WorkspaceEvent::MinimizeToplevel(handle),
+            });
+        }
+    }
+
+    fn close_window_list(&mut self) -> app::Task<Message> {
+        match self.window_list.take() {
+            Some((popup, _)) => surface::surface_task(surface::action::destroy_popup(popup)),
+            None => Task::none(),
+        }
+    }
+
+    /// Opens the window list under an icon, or closes it if it is already open there.
+    fn toggle_window_list(&mut self, id: AppIconId) -> app::Task<Message> {
+        let was_open_here = self
+            .window_list
+            .as_ref()
+            .is_some_and(|(_, open)| *open == id);
+        let mut tasks = vec![self.close_window_list()];
+        if let Some(popup) = self.popup.take() {
+            tasks.push(surface::surface_task(surface::action::destroy_popup(popup)));
+        }
+        if was_open_here {
+            return Task::batch(tasks);
+        }
+
+        let anchor = self.icon_rectangles.get(&id).copied();
+        tasks.push(surface::surface_task(surface::action::app_popup(
+            |_| Default::default(),
+            move |app: &mut Self| {
+                let popup = window::Id::unique();
+                app.window_list = Some((popup, id.clone()));
+                let mut settings = app.core.applet.get_popup_settings(
+                    app.core.main_window_id().unwrap(),
+                    popup,
+                    None,
+                    None,
+                    None,
+                );
+                if let Some(anchor) = anchor {
+                    settings.positioner.anchor_rect = Rectangle {
+                        x: anchor.x.round() as i32,
+                        y: anchor.y.round() as i32,
+                        width: anchor.width.round() as i32,
+                        height: anchor.height.round() as i32,
+                    };
+                }
+                settings
+            },
+            None,
+        )));
+        Task::batch(tasks)
+    }
+
+    fn window_list_view(&self, id: &AppIconId) -> Element<'_, Message> {
+        let spacing = theme::active().cosmic().spacing;
+        let Some(metadata) = self.app_metadata.get(&id.app_id) else {
+            return self.core.applet.popup_container(column![]).into();
+        };
+        let rows = self.icon_windows(id).into_iter().map(|window| {
+            let activated = window
+                .state
+                .contains(&zcosmic_toplevel_handle_v1::State::Activated);
+            let minimized = window
+                .state
+                .contains(&zcosmic_toplevel_handle_v1::State::Minimized);
+            let title = match window.title.trim() {
+                "" => metadata.name.as_str(),
+                title => title,
+            };
+            let mut text = self
+                .core
+                .applet
+                .text(title.to_owned())
+                .size(14)
+                .wrapping(cosmic::iced::core::text::Wrapping::None);
+            if activated {
+                text = text.font(cosmic::font::bold());
+            }
+            let content = row![
+                self.app_icon(
+                    metadata,
+                    WINDOW_LIST_ICON_SIZE,
+                    minimized,
+                    false,
+                    WINDOW_LIST_ICON_SIZE,
+                ),
+                text
+            ]
+            .spacing(spacing.space_xs)
+            .align_y(Alignment::Center);
+            Element::from(
+                menu_button(content)
+                    .on_press(Message::WindowChosen(window.foreign_toplevel.clone())),
+            )
+        });
+
+        self.core
+            .applet
+            .popup_container(column(rows).padding([spacing.space_xxs, 0]))
+            .into()
+    }
+
+    /// Lets an icon focus its windows instead of switching workspace, when enabled.
+    fn clickable_icon<'a>(
+        &'a self,
+        workspace: &Workspace,
+        target: Option<IconTarget<'_>>,
+        icon: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let Some(target) = target.filter(|_| self.config.focus_windows_from_icons) else {
+            return icon;
+        };
+        let id = AppIconId {
+            workspace: workspace.handle.id(),
+            app_id: target.app_id.to_owned(),
+            window: target.window.map(Proxy::id),
+        };
+        // The mouse area captures the press, so the workspace button ignores it.
+        let icon = mouse_area(icon).on_press(Message::AppIconPressed(id.clone()));
+        match self.rectangle_tracker.as_ref() {
+            Some(tracker) => tracker.container(id, icon).into(),
+            None => icon.into(),
+        }
     }
 
     fn app_icon(
@@ -1458,13 +1738,14 @@ impl IcedWorkspacesApplet {
             .take(visible_icon_count)
             .zip(self.visible_icon_slot_sizes(icons))
             .map(|(icon, slot_size)| {
-                self.app_icon(
+                let element = self.app_icon(
                     icon.metadata,
                     icon_size,
                     self.config.dim_minimized_window_icons && icon.minimized,
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
-                )
+                );
+                self.clickable_icon(workspace, icon.target, element)
             })
             .collect::<Vec<_>>();
         if overflow_count > 0 {
@@ -1717,16 +1998,18 @@ mod tests {
     use super::{
         APP_GROUP_LEADING_PADDING, APP_GROUP_TRAILING_PADDING, APP_ICON_SPACING, AppMetadata,
         Background, Color, IcedWorkspacesApplet, Layout, MAX_PILL_BORDER_WIDTH,
-        MIN_PILL_BORDER_WIDTH, Theme, URGENT_FILLED_BORDER_WIDTH, WORKSPACE_CONTENT_PADDING,
-        WORKSPACE_CONTENT_SPACING, WORKSPACE_LIST_EDGE_PADDING, PillStyleSelection, WorkspaceApp,
-        WorkspaceIndicator, WorkspaceWindowState, app_group_leading_padding, display_icons,
-        inactive_pill_brightness_percent, inactive_pill_color, informative_titles,
-        occupied_number_section_major_size, oriented_padding, pill_border_width,
-        pill_spacing_percent, should_retain_toplevel_placement, visible_icon_counts,
-        visible_icon_limit, workspace_cutout_svg, workspace_edge_padding, workspace_indicator,
-        workspace_list_padding, workspace_major_size, workspace_number_font_size,
-        workspace_overflow_size, workspace_overview_command, workspace_pill_radii,
-        show_empty_workspace_dot, workspace_symbol_is_cutout, workspace_tooltip,
+        MIN_PILL_BORDER_WIDTH, PillStyleSelection, Theme, URGENT_FILLED_BORDER_WIDTH,
+        WORKSPACE_CONTENT_PADDING, WORKSPACE_CONTENT_SPACING, WORKSPACE_LIST_EDGE_PADDING,
+        WindowClick, WorkspaceApp, WorkspaceIndicator, WorkspaceWindowState,
+        app_group_leading_padding, display_icons, inactive_pill_brightness_percent,
+        inactive_pill_color, informative_titles, occupied_number_section_major_size,
+        oriented_padding, pill_border_width, pill_spacing_percent,
+        should_retain_toplevel_placement, show_empty_workspace_dot, visible_icon_counts,
+        visible_icon_limit, window_click, workspace_cutout_svg, workspace_edge_padding,
+        workspace_indicator, workspace_list_padding, workspace_major_size,
+        workspace_number_font_size, workspace_overflow_size, workspace_overview_command,
+        workspace_pill_radii, workspace_symbol_is_cutout, workspace_tooltip,
+        zcosmic_toplevel_handle_v1,
     };
 
     const TEST_OUTLINED_BORDER_WIDTH: f32 = 2.0;
@@ -1903,7 +2186,67 @@ mod tests {
             metadata,
             minimized_titles: Vec::new(),
             windows,
+            handles: Vec::new(),
         }
+    }
+
+    #[test]
+    fn clicking_the_focused_window_minimizes_it() {
+        use zcosmic_toplevel_handle_v1::State;
+
+        let click = |states: &[State]| window_click(&states.iter().copied().collect());
+
+        assert_eq!(click(&[State::Activated]), WindowClick::Minimize);
+        assert_eq!(
+            click(&[State::Activated, State::Maximized]),
+            WindowClick::Minimize
+        );
+        assert_eq!(click(&[]), WindowClick::Activate);
+        assert_eq!(click(&[State::Minimized]), WindowClick::Activate);
+        assert_eq!(
+            click(&[State::Activated, State::Minimized]),
+            WindowClick::Activate
+        );
+    }
+
+    #[test]
+    fn grouped_icons_target_the_whole_app() {
+        let metadata = test_metadata("Browser");
+        let apps = [test_app(
+            "browser",
+            &metadata,
+            vec![
+                WorkspaceWindowState {
+                    minimized: false,
+                    maximized: false,
+                },
+                WorkspaceWindowState {
+                    minimized: false,
+                    maximized: false,
+                },
+            ],
+        )];
+
+        let icons = display_icons(&apps, true);
+
+        let target = icons[0].target.expect("grouped icon target");
+        assert_eq!(target.app_id, "browser");
+        assert!(target.window.is_none());
+    }
+
+    #[test]
+    fn expanded_icons_without_window_handles_have_no_target() {
+        let metadata = test_metadata("Browser");
+        let apps = [test_app(
+            "browser",
+            &metadata,
+            vec![WorkspaceWindowState {
+                minimized: false,
+                maximized: false,
+            }],
+        )];
+
+        assert!(display_icons(&apps, false)[0].target.is_none());
     }
 
     fn test_metadata(name: &str) -> AppMetadata {
@@ -2961,6 +3304,9 @@ mod tests {
 enum Message {
     WorkspaceUpdate(WorkspacesUpdate),
     WorkspacePressed(ExtWorkspaceHandleV1),
+    AppIconPressed(AppIconId),
+    WindowChosen(ExtForeignToplevelHandleV1),
+    IconRectangle(RectangleUpdate<AppIconId>),
     WheelScrolled(ScrollDelta),
     WorkspaceOverview,
     TogglePopup,
@@ -2969,6 +3315,7 @@ enum Message {
     HighlightMaximizedWindowIcons(bool),
     ShowOneIconPerApplication(bool),
     ShowWorkspaceNumbers(bool),
+    FocusWindowsFromIcons(bool),
     MaxVisibleIcons(u8),
     PillStyle(usize),
     PillBorderWidth(u8),
@@ -3018,6 +3365,9 @@ impl cosmic::Application for IcedWorkspacesApplet {
             config,
             config_helper,
             popup: None,
+            window_list: None,
+            rectangle_tracker: None,
+            icon_rectangles: HashMap::new(),
         };
         app.update_desktop_entries();
 
@@ -3051,6 +3401,21 @@ impl cosmic::Application for IcedWorkspacesApplet {
                     self.toplevels = snapshot.toplevels;
                     self.output = snapshot.output;
                     self.sync_app_metadata();
+
+                    let workspace_ids = self
+                        .workspaces
+                        .iter()
+                        .map(|workspace| workspace.handle.id())
+                        .collect::<HashSet<_>>();
+                    self.icon_rectangles
+                        .retain(|id, _| workspace_ids.contains(&id.workspace));
+                    if self
+                        .window_list
+                        .as_ref()
+                        .is_some_and(|(_, id)| self.icon_windows(id).is_empty())
+                    {
+                        return self.close_window_list();
+                    }
                 }
                 WorkspacesUpdate::Started(tx) => {
                     self.workspace_tx.replace(tx);
@@ -3064,6 +3429,40 @@ impl cosmic::Application for IcedWorkspacesApplet {
                     let _ = tx.try_send(WorkspaceEvent::Activate(id));
                 }
             }
+            Message::AppIconPressed(id) => {
+                let windows = self
+                    .icon_windows(&id)
+                    .into_iter()
+                    .map(|window| (window.foreign_toplevel.clone(), window_click(&window.state)))
+                    .collect::<Vec<_>>();
+                return match windows.as_slice() {
+                    [] => Task::none(),
+                    [(handle, click)] => {
+                        self.send_window_click(handle.clone(), *click);
+                        self.close_window_list()
+                    }
+                    _ => self.toggle_window_list(id),
+                };
+            }
+            Message::WindowChosen(handle) => {
+                if let Some(click) = self
+                    .toplevels
+                    .iter()
+                    .find(|toplevel| toplevel.foreign_toplevel == handle)
+                    .map(|toplevel| window_click(&toplevel.state))
+                {
+                    self.send_window_click(handle, click);
+                }
+                return self.close_window_list();
+            }
+            Message::IconRectangle(update) => match update {
+                RectangleUpdate::Init(tracker) => {
+                    self.rectangle_tracker = Some(tracker);
+                }
+                RectangleUpdate::Rectangle((id, rectangle)) => {
+                    self.icon_rectangles.insert(id, rectangle);
+                }
+            },
             Message::WheelScrolled(delta) => {
                 let discrete_delta = self.scroll.update(delta);
                 if discrete_delta.y != 0
@@ -3087,7 +3486,8 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 launch_workspace_overview();
             }
             Message::TogglePopup => {
-                return if let Some(popup) = self.popup.take() {
+                let close_window_list = self.close_window_list();
+                let toggle_settings = if let Some(popup) = self.popup.take() {
                     surface::surface_task(surface::action::destroy_popup(popup))
                 } else {
                     surface::surface_task(surface::action::app_popup(
@@ -3108,10 +3508,18 @@ impl cosmic::Application for IcedWorkspacesApplet {
                         None,
                     ))
                 };
+                return Task::batch([close_window_list, toggle_settings]);
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                }
+                if self
+                    .window_list
+                    .as_ref()
+                    .is_some_and(|(popup, _)| *popup == id)
+                {
+                    self.window_list = None;
                 }
             }
             Message::DimMinimizedWindowIcons(enabled) => {
@@ -3128,6 +3536,10 @@ impl cosmic::Application for IcedWorkspacesApplet {
             }
             Message::ShowWorkspaceNumbers(enabled) => {
                 self.config.show_workspace_numbers = enabled;
+                self.write_config();
+            }
+            Message::FocusWindowsFromIcons(enabled) => {
+                self.config.focus_windows_from_icons = enabled;
                 self.write_config();
             }
             Message::MaxVisibleIcons(limit) => {
@@ -3260,6 +3672,8 @@ impl cosmic::Application for IcedWorkspacesApplet {
                     Message::ConfigUpdated(update.config)
                 }),
             workspaces().map(Message::WorkspaceUpdate),
+            rectangle_tracker::subscription("app-icons")
+                .map(|(_, update)| Message::IconRectangle(update)),
             event::listen_with(|e, _, _| match e {
                 Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::WheelScrolled(delta)),
                 _ => None,
@@ -3268,6 +3682,11 @@ impl cosmic::Application for IcedWorkspacesApplet {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        if let Some((popup, icon)) = self.window_list.as_ref()
+            && *popup == id
+        {
+            return self.window_list_view(icon);
+        }
         let spacing = theme::active().cosmic().spacing;
         let selected_pill_style = PillStyleSelection::ALL.iter().position(|style| {
             style.styles() == (self.config.pill_style, self.config.inactive_pill_style)
@@ -3336,6 +3755,13 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 toggler(self.config.show_workspace_numbers)
                     .on_toggle(Message::ShowWorkspaceNumbers)
                     .label(crate::fl!("show-workspace-numbers"))
+                    .text_size(14)
+                    .width(Length::Fill)
+            ),
+            padded_control(
+                toggler(self.config.focus_windows_from_icons)
+                    .on_toggle(Message::FocusWindowsFromIcons)
+                    .label(crate::fl!("focus-windows-from-icons"))
                     .text_size(14)
                     .width(Length::Fill)
             ),

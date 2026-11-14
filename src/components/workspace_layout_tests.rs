@@ -32,6 +32,9 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         },
         config_helper: None,
         popup: None,
+        window_list: None,
+        rectangle_tracker: None,
+        icon_rectangles: HashMap::new(),
     }
 }
 
@@ -187,6 +190,7 @@ fn calculated_button_size_matches_actual_overflow_layout() {
                                 metadata: &metadata,
                                 minimized: false,
                                 maximized: highlighted[index.min(2)],
+                                target: None,
                             })
                             .collect();
                         for spacing in [0, 10] {
@@ -321,6 +325,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                     metadata: &metadata,
                     minimized: false,
                     maximized: false,
+                    target: None,
                 })
                 .collect();
             let before = probe(&app, &workspace, &icons, false, &renderer);
@@ -328,6 +333,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                 metadata: &metadata,
                 minimized: false,
                 maximized: true,
+                target: None,
             });
             let after = probe(&app, &workspace, &icons, false, &renderer);
             assert_eq!(before.frames.len(), after.frames.len());
@@ -408,6 +414,7 @@ fn overflow_grows_by_its_natural_text_extent_without_changing_end_padding() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: *maximized,
+                            target: None,
                         })
                         .collect();
                     let before = probe(&app, &workspace, &icons, false, &renderer);
@@ -573,6 +580,7 @@ fn render_layout_samples_and_asset_bounds() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: i == if variant == 0 { 0 } else { 2 },
+                            target: None,
                         })
                         .collect();
                     let hovered = variant == 2;
