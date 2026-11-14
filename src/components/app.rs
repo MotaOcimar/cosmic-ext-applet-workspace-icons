@@ -35,7 +35,7 @@ use cosmic::{
         event,
         mouse::{self, ScrollDelta},
         time::Instant,
-        widget::{Image, Svg, button, column, row, space, stack},
+        widget::{Image, Stack, Svg, button, column, pin, row, space, stack},
         window,
     },
     scroll::DiscreteScrollState,
@@ -72,6 +72,9 @@ use std::{
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 /// How long a workspace pill takes to grow or shrink to its new size.
 const PILL_SIZE_ANIMATION: Duration = Duration::from_millis(300);
+/// How long an app icon takes to fly to another pill or fade in. It matches
+/// the pill animation, so the icon lands as its pill finishes growing.
+const ICON_ANIMATION: Duration = PILL_SIZE_ANIMATION;
 const WINDOW_LIST_ICON_SIZE: f32 = 20.0;
 
 /// Mime type of an app icon dragged between workspaces. Only this applet
@@ -726,8 +729,21 @@ struct IcedWorkspacesApplet {
     drop_target: Option<ObjectId>,
     /// Major-axis size of each workspace pill, animated when it changes.
     pill_sizes: HashMap<ObjectId, Animation<f32>>,
+    /// App icons flying to another pill after their windows moved there.
+    icon_flights: Vec<IconFlight>,
+    /// App icons fading in after they appeared without coming from another pill.
+    icon_fades: HashMap<AppIconId, Animation<bool>>,
     /// Time used to sample the animations, advanced on every frame.
     now: Instant,
+}
+
+/// An app icon flying from its old pill to its new one. The icon in the new
+/// pill stays hidden until the flight ends, so it seems to land there.
+struct IconFlight {
+    to: AppIconId,
+    /// Where the icon was last drawn in its old pill.
+    from: Rectangle,
+    progress: Animation<bool>,
 }
 
 struct AppMetadata {
@@ -770,6 +786,16 @@ struct IconTarget<'a> {
     window: Option<&'a ExtForeignToplevelHandleV1>,
     /// Windows behind the icon, shown as "×N" in its tooltip.
     window_count: usize,
+}
+
+/// Id of the icon a pill shows for some app windows, if it acts on them.
+fn icon_id(workspace: &Workspace, icon: &WorkspaceIcon<'_>) -> Option<AppIconId> {
+    let target = icon.target?;
+    Some(AppIconId {
+        workspace: workspace.handle.id(),
+        app_id: target.app_id.to_owned(),
+        window: target.window.map(Proxy::id),
+    })
 }
 
 /// The app name, with "×N" when it has more than one window.
@@ -1493,10 +1519,172 @@ impl IcedWorkspacesApplet {
         }
     }
 
-    fn pill_size_animating(&self) -> bool {
+    fn animating(&self) -> bool {
         self.pill_sizes
             .values()
             .any(|size| size.is_animating(self.now))
+            || self
+                .icon_flights
+                .iter()
+                .any(|flight| flight.progress.is_animating(self.now))
+            || self
+                .icon_fades
+                .values()
+                .any(|fade| fade.is_animating(self.now))
+    }
+
+    /// Ids of the app icons the pills show, including those past the visible limit.
+    fn shown_icon_ids(&self) -> Vec<AppIconId> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| {
+                let apps = self.displayed_apps(workspace);
+                display_icons(&apps, self.config.show_one_icon_per_application)
+                    .iter()
+                    .filter_map(|icon| icon_id(workspace, icon))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The workspaces each window is on, keyed by window.
+    fn window_placements(&self) -> Vec<(ObjectId, Vec<ObjectId>)> {
+        self.toplevels
+            .iter()
+            .map(|toplevel| {
+                let workspaces = self
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| self.toplevel_is_on(toplevel, workspace))
+                    .map(|workspace| workspace.handle.id())
+                    .collect();
+                (toplevel.foreign_toplevel.id(), workspaces)
+            })
+            .collect()
+    }
+
+    /// Animates the icons that appeared since the last snapshot: an icon whose
+    /// windows came from another pill flies from there, any other fades in.
+    fn animate_new_icons(
+        &mut self,
+        shown_before: &[AppIconId],
+        placements_before: &[(ObjectId, Vec<ObjectId>)],
+    ) {
+        let now = Instant::now();
+        let placements = self.window_placements();
+        let appeared = self
+            .shown_icon_ids()
+            .into_iter()
+            .filter(|id| !shown_before.contains(id))
+            .collect::<Vec<_>>();
+        if appeared.is_empty() {
+            return;
+        }
+        for to in appeared {
+            let from = self
+                .icon_origin(&to, placements_before, &placements)
+                .and_then(|from| self.icon_rectangles.get(&from).copied());
+            match from {
+                Some(from) => self.icon_flights.push(IconFlight {
+                    to,
+                    from,
+                    progress: Animation::new(false)
+                        .duration(ICON_ANIMATION)
+                        .easing(Easing::EaseInOutCubic)
+                        .go(true, now),
+                }),
+                None => {
+                    self.icon_fades.insert(
+                        to,
+                        Animation::new(false)
+                            .duration(ICON_ANIMATION)
+                            .easing(Easing::EaseOutCubic)
+                            .go(true, now),
+                    );
+                }
+            }
+        }
+        self.now = now;
+    }
+
+    /// The icon that a newly shown icon replaces on another pill: the one its
+    /// windows left when they moved to the new icon's workspace.
+    fn icon_origin(
+        &self,
+        to: &AppIconId,
+        placements_before: &[(ObjectId, Vec<ObjectId>)],
+        placements: &[(ObjectId, Vec<ObjectId>)],
+    ) -> Option<AppIconId> {
+        let workspaces_of = |placements: &[(ObjectId, Vec<ObjectId>)], window: &ObjectId| {
+            placements
+                .iter()
+                .find(|(id, _)| id == window)
+                .map(|(_, workspaces)| workspaces.clone())
+                .unwrap_or_default()
+        };
+        self.icon_windows(to).into_iter().find_map(|window| {
+            let window = window.foreign_toplevel.id();
+            let now_on = workspaces_of(placements, &window);
+            workspaces_of(placements_before, &window)
+                .into_iter()
+                .find(|workspace| !now_on.contains(workspace))
+                .map(|workspace| AppIconId {
+                    workspace,
+                    app_id: to.app_id.clone(),
+                    window: to.window.clone(),
+                })
+        })
+    }
+
+    /// How visible an app icon is in its pill: hidden while it flies there,
+    /// partly visible while it fades in.
+    fn icon_visibility(&self, id: &AppIconId) -> f32 {
+        if self
+            .icon_flights
+            .iter()
+            .any(|flight| flight.to == *id && flight.progress.is_animating(self.now))
+        {
+            return 0.0;
+        }
+        self.icon_fades
+            .get(id)
+            .map_or(1.0, |fade| fade.interpolate(0.0, 1.0, self.now))
+    }
+
+    /// The icons in flight, drawn above the pills. The layer is always there,
+    /// even when empty, so the widget tree keeps its shape and the pills keep
+    /// their state when a flight starts or ends.
+    fn icon_flight_layer(&self) -> Element<'_, Message> {
+        let icon_size = self.app_icon_size();
+        let icons = self.icon_flights.iter().filter_map(|flight| {
+            if !flight.progress.is_animating(self.now) {
+                return None;
+            }
+            let metadata = self.app_metadata.get(&flight.to.app_id)?;
+            // Until the new pill is drawn, its icon has no position yet.
+            let to = self
+                .icon_rectangles
+                .get(&flight.to)
+                .copied()
+                .unwrap_or(flight.from);
+            let t = flight.progress.interpolate(0.0, 1.0, self.now);
+            let lerp = |from: f32, to: f32| from + (to - from) * t;
+            let icon = container(self.app_icon(metadata, icon_size, false, false, icon_size, 1.0))
+                .width(Length::Fixed(lerp(flight.from.width, to.width)))
+                .height(Length::Fixed(lerp(flight.from.height, to.height)))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center);
+            Some(
+                pin(icon)
+                    .x(lerp(flight.from.x, to.x))
+                    .y(lerp(flight.from.y, to.y))
+                    .into(),
+            )
+        });
+        Stack::with_children(icons)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn workspace_content_edge_padding(&self, icons: &[WorkspaceIcon<'_>]) -> f32 {
@@ -1793,6 +1981,7 @@ impl IcedWorkspacesApplet {
                     minimized,
                     false,
                     WINDOW_LIST_ICON_SIZE,
+                    1.0,
                 ),
                 text
             ]
@@ -1819,14 +2008,13 @@ impl IcedWorkspacesApplet {
         icon: &WorkspaceIcon<'_>,
         element: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let Some(target) = icon.target.filter(|_| self.config.focus_windows_from_icons) else {
+        let (Some(target), Some(id)) = (icon.target, icon_id(workspace, icon)) else {
             return element;
         };
-        let id = AppIconId {
-            workspace: workspace.handle.id(),
-            app_id: target.app_id.to_owned(),
-            window: target.window.map(Proxy::id),
-        };
+        if !self.config.focus_windows_from_icons {
+            // Still tracked, so an icon can fly from here when its windows move.
+            return self.track_icon(id, element);
+        }
         // Clicks act on release, so starting a drag does not also focus or
         // minimize, and only when the press started on the same icon. The mouse
         // area captures the press, so the workspace button ignores it.
@@ -1871,12 +2059,24 @@ impl IcedWorkspacesApplet {
             Message::Surface,
             None,
         );
+        self.track_icon(id, icon)
+    }
+
+    /// Reports where the icon is drawn, for popups anchored to it and for
+    /// icons flying from it.
+    fn track_icon<'a>(
+        &self,
+        id: AppIconId,
+        icon: impl Into<Element<'a, Message>>,
+    ) -> Element<'a, Message> {
         match self.rectangle_tracker.as_ref() {
             Some(tracker) => tracker.container(id, icon).into(),
             None => icon.into(),
         }
     }
 
+    /// `visibility` scales the icon's opacity, for icons fading in or not
+    /// landed yet.
     fn app_icon(
         &self,
         metadata: &AppMetadata,
@@ -1884,8 +2084,9 @@ impl IcedWorkspacesApplet {
         dimmed: bool,
         maximized: bool,
         slot_size: f32,
+        visibility: f32,
     ) -> Element<'_, Message> {
-        let opacity = if dimmed { MINIMIZED_ICON_OPACITY } else { 1.0 };
+        let opacity = visibility * if dimmed { MINIMIZED_ICON_OPACITY } else { 1.0 };
         let handle = metadata.icon_source.as_cosmic_icon();
         let symbolic = handle.symbolic;
 
@@ -1914,7 +2115,7 @@ impl IcedWorkspacesApplet {
                         return container::Style::default();
                     }
                     let glow = Color {
-                        a: MAXIMIZED_ICON_GLOW_OPACITY,
+                        a: MAXIMIZED_ICON_GLOW_OPACITY * visibility,
                         ..Color::WHITE
                     };
 
@@ -1967,12 +2168,15 @@ impl IcedWorkspacesApplet {
             .take(visible_icon_count)
             .zip(self.visible_icon_slot_sizes(icons))
             .map(|(icon, slot_size)| {
+                let visibility =
+                    icon_id(workspace, icon).map_or(1.0, |id| self.icon_visibility(&id));
                 let element = self.app_icon(
                     icon.metadata,
                     icon_size,
                     icon.in_transit || (self.config.dim_minimized_window_icons && icon.minimized),
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
+                    visibility,
                 );
                 self.clickable_icon(workspace, icon, element)
             })
@@ -3621,10 +3825,16 @@ impl IcedWorkspacesApplet {
                         .workspaces
                         .sort_by(|w1, w2| w1.coordinates.cmp(&w2.coordinates));
                     retain_transient_toplevel_placements(&self.toplevels, &mut snapshot.toplevels);
+                    // The first snapshot shows everything at once, with no animation.
+                    let shown_before = (!self.workspaces.is_empty())
+                        .then(|| (self.shown_icon_ids(), self.window_placements()));
                     self.workspaces = snapshot.workspaces;
                     self.toplevels = snapshot.toplevels;
                     self.output = snapshot.output;
                     self.sync_app_metadata();
+                    if let Some((icons, placements)) = shown_before {
+                        self.animate_new_icons(&icons, &placements);
+                    }
 
                     let workspace_ids = self
                         .workspaces
@@ -3831,6 +4041,9 @@ impl IcedWorkspacesApplet {
             }
             Message::AnimationFrame(at) => {
                 self.now = at;
+                self.icon_flights
+                    .retain(|flight| flight.progress.is_animating(at));
+                self.icon_fades.retain(|_, fade| fade.is_animating(at));
             }
         }
         Task::none()
@@ -3884,6 +4097,8 @@ impl cosmic::Application for IcedWorkspacesApplet {
             dragged_icon: None,
             drop_target: None,
             pill_sizes: HashMap::new(),
+            icon_flights: Vec::new(),
+            icon_fades: HashMap::new(),
             now: Instant::now(),
         };
         app.update_desktop_entries();
@@ -4004,7 +4219,10 @@ impl cosmic::Application for IcedWorkspacesApplet {
         }
 
         autosize::autosize(
-            container(layout_section).padding(workspace_list_padding(self.layout)),
+            stack![
+                container(layout_section).padding(workspace_list_padding(self.layout)),
+                self.icon_flight_layer(),
+            ],
             AUTOSIZE_MAIN_ID.clone(),
         )
         .limits(limits)
@@ -4027,7 +4245,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             })
         });
         let frames = self
-            .pill_size_animating()
+            .animating()
             .then(|| window::frames().map(|(_, at)| Message::AnimationFrame(at)));
         Subscription::batch(
             drag_end.into_iter().chain(frames).chain([
