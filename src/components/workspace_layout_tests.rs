@@ -1,4 +1,5 @@
 use super::*;
+use crate::wayland::WorkspaceSnapshot;
 use cctk::wayland_client::{Connection, Proxy};
 use cosmic::applet::cosmic_panel_config::PanelSize;
 use cosmic::iced::{Font, Pixels, Point};
@@ -41,6 +42,8 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         pill_sizes: HashMap::new(),
         icon_flights: Vec::new(),
         icon_growths: HashMap::new(),
+        icon_departures: Vec::new(),
+        icon_shrinks: Vec::new(),
         now: Instant::now(),
     }
 }
@@ -98,6 +101,8 @@ struct Probe {
     strip: Rectangle,
     frames: Vec<Rectangle>,
     items: Vec<Rectangle>,
+    /// Every child of the strip, with spacers and departure gaps.
+    strip_children: Vec<Rectangle>,
 }
 
 fn probe(
@@ -108,6 +113,19 @@ fn probe(
     renderer: &cosmic::Renderer,
 ) -> Probe {
     let major = app.workspace_button_major_size(icons);
+    probe_sized(app, workspace, icons, major, hovered, renderer)
+}
+
+/// Lays out a pill drawn at `major` size, which differs from the size its
+/// icons ask for while the pill animates.
+fn probe_sized(
+    app: &IcedWorkspacesApplet,
+    workspace: &Workspace,
+    icons: &[WorkspaceIcon<'_>],
+    major: f32,
+    hovered: bool,
+    renderer: &cosmic::Renderer,
+) -> Probe {
     let cross = app.workspace_cross_axis_size();
     let (width, height) = match app.layout {
         Layout::Row => (major, cross),
@@ -142,10 +160,15 @@ fn probe(
         content
     };
     let strip = app_group.children().next().unwrap();
-    let items: Vec<_> = strip.children().map(|item| item.bounds()).collect();
+    // The strip puts a spacer between its items.
+    let items: Vec<_> = strip
+        .children()
+        .step_by(2)
+        .map(|item| item.bounds())
+        .collect();
     let mut frames = Vec::new();
     let visible = visible_icon_counts(icons.len(), app.config.max_visible_icons).0;
-    for item in strip.children().take(visible) {
+    for item in strip.children().step_by(2).take(visible) {
         leaves(item, &mut frames);
     }
     Probe {
@@ -156,11 +179,161 @@ fn probe(
         strip: strip.bounds(),
         frames,
         items,
+        strip_children: strip.children().map(|child| child.bounds()).collect(),
     }
 }
 
 fn assert_near(a: f32, b: f32, context: &str) {
     assert!((a - b).abs() < 0.003, "{context}: {a} != {b}");
+}
+
+/// Closing an app animates its icon: in a pill with other icons, it shrinks
+/// in a closing gap; in a pill it leaves empty, it shrinks away where it was
+/// drawn.
+#[test]
+fn closed_apps_shrink_away() {
+    let mut app = fixture_app(Layout::Row, PanelSize::M, 56.0);
+    app.config.show_one_icon_per_application = true;
+    app.config.show_workspace_numbers = false;
+    let workspace = fixture_workspace();
+    let (client, _server) = UnixStream::pair().unwrap();
+    let connection = Connection::from_socket(client).unwrap();
+    let toplevel = |app_id: &str| ToplevelInfo {
+        title: app_id.into(),
+        app_id: app_id.into(),
+        identifier: app_id.into(),
+        state: HashSet::new(),
+        output: HashSet::new(),
+        geometry: HashMap::new(),
+        workspace: HashSet::from([workspace.handle.clone()]),
+        cosmic_toplevel: None,
+        foreign_toplevel: ExtForeignToplevelHandleV1::inert(connection.backend().downgrade()),
+    };
+    let snapshot = |toplevels: Vec<ToplevelInfo>| {
+        Message::WorkspaceUpdate(WorkspacesUpdate::Snapshot(WorkspaceSnapshot {
+            workspaces: vec![workspace.clone()],
+            toplevels,
+            output: None,
+        }))
+    };
+    let icon = |app_id: &str| AppIconId {
+        workspace: workspace.handle.id(),
+        app_id: app_id.into(),
+        window: None,
+    };
+
+    let _ = cosmic::Application::update(&mut app, snapshot(vec![toplevel("a"), toplevel("b")]));
+    // The rectangle tracker reports where the icons are drawn.
+    let size = app.app_icon_size();
+    app.icon_rectangles.insert(
+        icon("a"),
+        Rectangle::new(Point::new(10.0, 4.0), Size::new(size, size)),
+    );
+    app.icon_rectangles.insert(
+        icon("b"),
+        Rectangle::new(
+            Point::new(10.0 + size + APP_ICON_SPACING, 4.0),
+            Size::new(size, size),
+        ),
+    );
+
+    let _ = cosmic::Application::update(&mut app, snapshot(vec![toplevel("a")]));
+    assert_eq!(app.icon_departures.len(), 1, "closing b leaves a gap");
+    let departed = app.icon_departures[0].icon.as_ref().map(|icon| &icon.id);
+    assert_eq!(departed, Some(&icon("b")), "b shrinks in its gap");
+    assert!(app.icon_shrinks.is_empty());
+
+    let _ = cosmic::Application::update(&mut app, snapshot(Vec::new()));
+    let shrinking = app
+        .icon_shrinks
+        .iter()
+        .map(|shrink| &shrink.icon.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shrinking,
+        [&icon("a")],
+        "a shrinks away above the empty pill"
+    );
+    assert!(app.animating(), "frames keep coming while a shrinks");
+}
+
+/// While the gap of an icon that left its pill closes, the icons kept there
+/// stay in place: the one before the gap does not move, and the one after it
+/// keeps its distance to the pill's end, which moves as the pill shrinks.
+#[test]
+fn kept_icons_hold_their_place_while_a_departure_gap_closes() {
+    let temp = tempfile::tempdir().unwrap();
+    let icon_path = temp.path().join("symmetric.svg");
+    std::fs::write(&icon_path, SYMMETRIC_ICON).unwrap();
+    let metadata = Arc::new(AppMetadata {
+        name: "controlled".into(),
+        icon_source: fde::IconSource::Path(icon_path),
+    });
+    let icon = WorkspaceIcon {
+        metadata: &metadata,
+        minimized: false,
+        maximized: false,
+        in_transit: false,
+        target: None,
+    };
+    let workspace = fixture_workspace();
+    let renderer = renderer();
+    let end = |rect: Rectangle, layout: Layout| start(rect, layout) + major(rect, layout);
+    for layout in [Layout::Row, Layout::Column] {
+        let mut app = fixture_app(layout, PanelSize::M, 56.0);
+        for numbers in [false, true] {
+            app.config.show_workspace_numbers = numbers;
+            let before = probe(&app, &workspace, &[icon; 3], false, &renderer);
+            let full = app.workspace_button_major_size(&[icon; 3]);
+            let target = app.workspace_button_major_size(&[icon; 2]);
+            for shrinking in [false, true] {
+                let began = Instant::now();
+                app.pill_sizes.insert(
+                    workspace.handle.id(),
+                    Animation::new(full)
+                        .duration(PILL_SIZE_ANIMATION)
+                        .easing(Easing::EaseInOutCubic)
+                        .go(target, began),
+                );
+                app.icon_departures = vec![IconDeparture {
+                    workspace: workspace.handle.id(),
+                    index: 1,
+                    size: app.app_icon_size() + APP_ICON_SPACING,
+                    icon: shrinking.then(|| DrawnIcon {
+                        id: AppIconId {
+                            workspace: workspace.handle.id(),
+                            app_id: "controlled".into(),
+                            window: None,
+                        },
+                        slot: app.app_icon_size(),
+                        metadata: metadata.clone(),
+                        dimmed: false,
+                    }),
+                }];
+                for elapsed in [1, 75, 150, 225, 270] {
+                    app.now = began + Duration::from_millis(elapsed);
+                    let pill = app.pill_major_size(&workspace, target);
+                    let during = probe_sized(&app, &workspace, &[icon; 2], pill, false, &renderer);
+                    let context = format!(
+                        "{layout:?}, numbers={numbers}, shrinking={shrinking}, {elapsed} ms"
+                    );
+                    assert!(pill > target, "pill still shrinking: {context}");
+                    assert_near(
+                        start(during.strip_children[0], layout),
+                        start(before.strip_children[0], layout),
+                        &format!("icon before the gap stays put: {context}"),
+                    );
+                    assert_near(
+                        end(during.button, layout)
+                            - end(*during.strip_children.last().unwrap(), layout),
+                        end(before.button, layout)
+                            - end(*before.strip_children.last().unwrap(), layout),
+                        &format!("icon after the gap keeps its distance to the end: {context}"),
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
