@@ -12,6 +12,7 @@
   "finish-args": [
     "--share=ipc",
     "--socket=wayland",
+    "--socket=inherit-wayland-socket",
     "--socket=fallback-x11",
     "--device=dri",
     "--talk-name=com.system76.CosmicSettingsDaemon",
