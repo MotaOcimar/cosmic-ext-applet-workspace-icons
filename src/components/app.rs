@@ -39,7 +39,7 @@ use cosmic::{
     surface, theme,
     theme::Container as ContainerClass,
     widget::{
-        Id, autosize, container, divider,
+        DndSource, Id, autosize, container, divider, dnd_destination,
         dropdown::popup_dropdown,
         mouse_area,
         rectangle_tracker::{self, RectangleTracker, RectangleUpdate},
@@ -68,6 +68,22 @@ use std::{
 
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 const WINDOW_LIST_ICON_SIZE: f32 = 20.0;
+
+/// Mime type of an app icon dragged between workspaces. Only this applet
+/// accepts it; the applet keeps track of which icon is being dragged.
+const DRAGGED_ICON_MIME: &str = "application/x-io.github.crocodile.workspace-icons.app-icon";
+
+struct DraggedIcon;
+
+impl cosmic::iced::clipboard::mime::AsMimeTypes for DraggedIcon {
+    fn available(&self) -> Cow<'static, [String]> {
+        Cow::Owned(vec![DRAGGED_ICON_MIME.to_owned()])
+    }
+
+    fn as_bytes(&self, mime_type: &str) -> Option<Cow<'static, [u8]>> {
+        (mime_type == DRAGGED_ICON_MIME).then_some(Cow::Borrowed(&[]))
+    }
+}
 
 #[cfg(test)]
 #[path = "workspace_layout_tests.rs"]
@@ -697,6 +713,12 @@ struct IcedWorkspacesApplet {
     window_list: Option<(window::Id, AppIconId)>,
     rectangle_tracker: Option<RectangleTracker<AppIconId>>,
     icon_rectangles: HashMap<AppIconId, Rectangle>,
+    /// App icon pressed and not yet released; a click needs both on one icon.
+    pressed_icon: Option<AppIconId>,
+    /// App icon being dragged to another workspace.
+    dragged_icon: Option<AppIconId>,
+    /// Workspace under a dragged icon, highlighted as the drop target.
+    drop_target: Option<ObjectId>,
 }
 
 struct AppMetadata {
@@ -717,6 +739,8 @@ struct WorkspaceApp<'a> {
 struct WorkspaceWindowState {
     minimized: bool,
     maximized: bool,
+    /// Dragged to another workspace, but not dropped yet.
+    in_transit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -724,6 +748,8 @@ struct WorkspaceIcon<'a> {
     metadata: &'a AppMetadata,
     minimized: bool,
     maximized: bool,
+    /// All its windows are being dragged, so it is drawn dimmed.
+    in_transit: bool,
     /// What a click on the icon acts on, when focusing windows from icons.
     target: Option<IconTarget<'a>>,
 }
@@ -790,6 +816,10 @@ impl WorkspaceApp<'_> {
     fn has_maximized(&self) -> bool {
         self.windows.iter().any(|window| window.maximized)
     }
+
+    fn all_in_transit(&self) -> bool {
+        !self.windows.is_empty() && self.windows.iter().all(|window| window.in_transit)
+    }
 }
 
 fn display_icons<'a>(
@@ -802,6 +832,7 @@ fn display_icons<'a>(
                 metadata: app.metadata,
                 minimized: app.all_minimized(),
                 maximized: app.has_maximized(),
+                in_transit: app.all_in_transit(),
                 target: Some(IconTarget {
                     app_id: app.app_id,
                     window: None,
@@ -819,6 +850,7 @@ fn display_icons<'a>(
                         metadata: app.metadata,
                         minimized: window.minimized,
                         maximized: window.maximized,
+                        in_transit: window.in_transit,
                         target: app.handles.get(index).map(|handle| IconTarget {
                             app_id: app.app_id,
                             window: Some(*handle),
@@ -1505,11 +1537,43 @@ impl IcedWorkspacesApplet {
             .collect()
     }
 
+    /// Apps on a workspace, with the windows of a dragged icon marked as in transit.
     fn apps_for_workspace(&self, workspace: &Workspace) -> Vec<WorkspaceApp<'_>> {
+        self.workspace_apps(workspace, false)
+    }
+
+    /// Apps drawn on a workspace's pill. While an icon is dragged over another
+    /// workspace, that pill also shows the icon's windows, as a preview of the
+    /// drop, the way the dock shows where a dragged app will land.
+    fn displayed_apps(&self, workspace: &Workspace) -> Vec<WorkspaceApp<'_>> {
+        let previewed = self.drop_preview_workspace() == Some(workspace.handle.id());
+        self.workspace_apps(workspace, previewed)
+    }
+
+    /// Workspace that would receive the dragged icon's windows if dropped now.
+    fn drop_preview_workspace(&self) -> Option<ObjectId> {
+        let dragged = self.dragged_icon.as_ref()?;
+        self.drop_target
+            .clone()
+            .filter(|target| *target != dragged.workspace)
+    }
+
+    fn workspace_apps(&self, workspace: &Workspace, with_dragged: bool) -> Vec<WorkspaceApp<'_>> {
+        let dragged_windows = self
+            .dragged_icon
+            .as_ref()
+            .map(|icon| {
+                self.icon_windows(icon)
+                    .into_iter()
+                    .map(|window| window.foreign_toplevel.id())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut apps = Vec::<WorkspaceApp<'_>>::new();
 
         for toplevel in &self.toplevels {
-            if !self.toplevel_is_on(toplevel, workspace) {
+            let in_transit = dragged_windows.contains(&toplevel.foreign_toplevel.id());
+            if !self.toplevel_is_on(toplevel, workspace) && !(with_dragged && in_transit) {
                 continue;
             }
             let Some(metadata) = self.app_metadata.get(&toplevel.app_id) else {
@@ -1526,6 +1590,7 @@ impl IcedWorkspacesApplet {
                 app.windows.push(WorkspaceWindowState {
                     minimized,
                     maximized,
+                    in_transit,
                 });
                 app.handles.push(&toplevel.foreign_toplevel);
                 if minimized {
@@ -1542,6 +1607,7 @@ impl IcedWorkspacesApplet {
                     windows: vec![WorkspaceWindowState {
                         minimized,
                         maximized,
+                        in_transit,
                     }],
                     handles: vec![&toplevel.foreign_toplevel],
                 });
@@ -1557,6 +1623,31 @@ impl IcedWorkspacesApplet {
                 WindowClick::Activate => WorkspaceEvent::ActivateToplevel(handle),
                 WindowClick::Minimize => WorkspaceEvent::MinimizeToplevel(handle),
             });
+        }
+    }
+
+    /// Moves the windows behind an icon to another workspace on this output.
+    fn move_icon_windows(&mut self, icon: &AppIconId, workspace: &ObjectId) {
+        if icon.workspace == *workspace {
+            return;
+        }
+        let Some(target) = self
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.handle.id() == *workspace)
+            .map(|candidate| candidate.handle.clone())
+        else {
+            return;
+        };
+        let windows = self
+            .icon_windows(icon)
+            .into_iter()
+            .map(|window| window.foreign_toplevel.clone())
+            .collect::<Vec<_>>();
+        if let Some(tx) = self.workspace_tx.as_mut() {
+            for window in windows {
+                let _ = tx.try_send(WorkspaceEvent::MoveToplevel(window, target.clone()));
+            }
         }
     }
 
@@ -1658,8 +1749,9 @@ impl IcedWorkspacesApplet {
             .into()
     }
 
-    /// Lets an icon focus its windows instead of switching workspace, when enabled.
-    /// The icon then gets its own tooltip, like the dock.
+    /// Lets an icon focus its windows instead of switching workspace, or be
+    /// dragged to another workspace, when enabled. The icon then gets its own
+    /// tooltip, like the dock.
     fn clickable_icon<'a>(
         &'a self,
         workspace: &Workspace,
@@ -1674,8 +1766,43 @@ impl IcedWorkspacesApplet {
             app_id: target.app_id.to_owned(),
             window: target.window.map(Proxy::id),
         };
-        // The mouse area captures the press, so the workspace button ignores it.
-        let element = mouse_area(element).on_press(Message::AppIconPressed(id.clone()));
+        // Clicks act on release, so starting a drag does not also focus or
+        // minimize, and only when the press started on the same icon. The mouse
+        // area captures the press, so the workspace button ignores it.
+        let element = mouse_area(element)
+            .on_press(Message::AppIconPressed(id.clone()))
+            .on_release(Message::AppIconReleased(id.clone()));
+        let drag_icon = icon.metadata.icon_source.as_cosmic_icon();
+        let drag_icon_size = self.app_icon_size().round() as u16;
+        // Keep the automatic id: the tree carries it across rebuilds. A named id
+        // would be shared by the normal and hovered copies of the pill, and the
+        // runtime would hand the saved state to only one of them.
+        //
+        // TODO(cosmic-panel): the panel does not show the drag icon of its
+        // applets (the dock's is missing too), so nothing follows the cursor
+        // yet (pop-os/cosmic-panel#724). The icon is set anyway, to appear
+        // once the panel is fixed; meanwhile the pill under the cursor
+        // previews the drop (see `displayed_apps`).
+        let mut element = DndSource::new(element)
+            .drag_content(|| DraggedIcon)
+            .drag_icon(move |offset| {
+                let icon: Element<'static, ()> = cosmic::widget::icon(drag_icon.clone())
+                    .size(drag_icon_size)
+                    .into();
+                // The runtime wraps the icon in a container, which takes the
+                // icon's tag, so the icon's own state goes at the root.
+                let state = icon.as_widget().state();
+                (icon, state, offset)
+            })
+            .on_start(Some(Message::IconDragStarted(id.clone())))
+            .on_cancel(Some(Message::IconDragEnded))
+            .on_finish(Some(Message::IconDragEnded));
+        // Name the surface the drag starts from. Otherwise the runtime searches
+        // the widgets for it whenever a tooltip is open, the hover switch hides
+        // its children from that search, and the drag never starts.
+        if let Some(window) = self.core.main_window_id() {
+            element = element.window(window);
+        }
         let icon = self.core.applet.applet_tooltip(
             element,
             app_summary(&icon.metadata.name, target.window_count),
@@ -1693,15 +1820,11 @@ impl IcedWorkspacesApplet {
         &self,
         metadata: &AppMetadata,
         icon_size: f32,
-        minimized: bool,
+        dimmed: bool,
         maximized: bool,
         slot_size: f32,
     ) -> Element<'_, Message> {
-        let opacity = if minimized {
-            MINIMIZED_ICON_OPACITY
-        } else {
-            1.0
-        };
+        let opacity = if dimmed { MINIMIZED_ICON_OPACITY } else { 1.0 };
         let handle = metadata.icon_source.as_cosmic_icon();
         let symbolic = handle.symbolic;
 
@@ -1786,7 +1909,7 @@ impl IcedWorkspacesApplet {
                 let element = self.app_icon(
                     icon.metadata,
                     icon_size,
-                    self.config.dim_minimized_window_icons && icon.minimized,
+                    icon.in_transit || (self.config.dim_minimized_window_icons && icon.minimized),
                     self.config.highlight_maximized_window_icons && icon.maximized,
                     slot_size,
                 );
@@ -2264,10 +2387,12 @@ mod tests {
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                 },
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                 },
             ],
         )];
@@ -2278,6 +2403,33 @@ mod tests {
         assert_eq!(target.app_id, "browser");
         assert!(target.window.is_none());
         assert_eq!(target.window_count, 2);
+    }
+
+    #[test]
+    fn icons_dim_only_when_all_their_windows_are_dragged() {
+        let window = |in_transit| WorkspaceWindowState {
+            minimized: false,
+            maximized: false,
+            in_transit,
+        };
+        let metadata = test_metadata("Browser");
+        // One window was already here; the other is previewed from a drag.
+        let mixed = [test_app(
+            "browser",
+            &metadata,
+            vec![window(false), window(true)],
+        )];
+        let dragged = [test_app(
+            "browser",
+            &metadata,
+            vec![window(true), window(true)],
+        )];
+
+        assert!(!display_icons(&mixed, true)[0].in_transit);
+        assert!(display_icons(&dragged, true)[0].in_transit);
+        let per_window = display_icons(&mixed, false);
+        assert!(!per_window[0].in_transit);
+        assert!(per_window[1].in_transit);
     }
 
     #[test]
@@ -2295,6 +2447,7 @@ mod tests {
             vec![WorkspaceWindowState {
                 minimized: false,
                 maximized: false,
+                in_transit: false,
             }],
         )];
 
@@ -2318,10 +2471,12 @@ mod tests {
                 WorkspaceWindowState {
                     minimized: true,
                     maximized: false,
+                    in_transit: false,
                 },
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: true,
+                    in_transit: false,
                 },
             ],
         )];
@@ -2345,10 +2500,12 @@ mod tests {
                     WorkspaceWindowState {
                         minimized: true,
                         maximized: false,
+                        in_transit: false,
                     },
                     WorkspaceWindowState {
                         minimized: false,
                         maximized: true,
+                        in_transit: false,
                     },
                 ],
             ),
@@ -2358,6 +2515,7 @@ mod tests {
                 vec![WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                 }],
             ),
         ];
@@ -2398,10 +2556,12 @@ mod tests {
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                 },
                 WorkspaceWindowState {
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                 },
             ],
         )];
@@ -3357,6 +3517,14 @@ enum Message {
     WorkspaceUpdate(WorkspacesUpdate),
     WorkspacePressed(ExtWorkspaceHandleV1),
     AppIconPressed(AppIconId),
+    AppIconReleased(AppIconId),
+    IconDragStarted(AppIconId),
+    IconDragEnded,
+    /// The pointer acts on the applet again, so no drag is in progress.
+    PointerReturned,
+    DropTargetEntered(ObjectId),
+    DropTargetLeft(ObjectId),
+    IconDropped(ObjectId),
     WindowChosen(ExtForeignToplevelHandleV1),
     IconRectangle(RectangleUpdate<AppIconId>),
     WheelScrolled(ScrollDelta),
@@ -3420,6 +3588,9 @@ impl cosmic::Application for IcedWorkspacesApplet {
             window_list: None,
             rectangle_tracker: None,
             icon_rectangles: HashMap::new(),
+            pressed_icon: None,
+            dragged_icon: None,
+            drop_target: None,
         };
         app.update_desktop_entries();
 
@@ -3482,6 +3653,12 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 }
             }
             Message::AppIconPressed(id) => {
+                self.pressed_icon = Some(id);
+            }
+            Message::AppIconReleased(id) => {
+                if self.pressed_icon.take().as_ref() != Some(&id) {
+                    return Task::none();
+                }
                 let windows = self
                     .icon_windows(&id)
                     .into_iter()
@@ -3495,6 +3672,29 @@ impl cosmic::Application for IcedWorkspacesApplet {
                     }
                     _ => self.toggle_window_list(id),
                 };
+            }
+            Message::IconDragStarted(id) => {
+                self.pressed_icon = None;
+                self.dragged_icon = Some(id);
+                return self.close_window_list();
+            }
+            Message::IconDragEnded | Message::PointerReturned => {
+                self.dragged_icon = None;
+                self.drop_target = None;
+            }
+            Message::DropTargetEntered(workspace) => {
+                self.drop_target = Some(workspace);
+            }
+            Message::DropTargetLeft(workspace) => {
+                if self.drop_target.as_ref() == Some(&workspace) {
+                    self.drop_target = None;
+                }
+            }
+            Message::IconDropped(workspace) => {
+                self.drop_target = None;
+                if let Some(icon) = self.dragged_icon.take() {
+                    self.move_icon_windows(&icon, &workspace);
+                }
             }
             Message::WindowChosen(handle) => {
                 if let Some(click) = self
@@ -3642,7 +3842,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
         let buttons = self.workspaces[..popup_index].iter().map(|w| {
             let horizontal = self.core.applet.is_horizontal();
             let active = w.state.contains(ext_workspace_handle_v1::State::Active);
-            let apps = self.apps_for_workspace(w);
+            let apps = self.displayed_apps(w);
             let icons = display_icons(&apps, self.config.show_one_icon_per_application);
             let major_size = self.workspace_button_major_size(&icons);
             let (width, height) = if horizontal {
@@ -3651,7 +3851,10 @@ impl cosmic::Application for IcedWorkspacesApplet {
                 (suggested_window_size.0.get() as f32, major_size)
             };
             let has_apps = !icons.is_empty();
-            let normal = self.workspace_pill_visual(w, &icons, width, height, false);
+            // The pointer does not move inside the applet during a drag, so the
+            // drop target is highlighted from the drop events instead.
+            let is_drop_target = self.drop_target.as_ref() == Some(&w.handle.id());
+            let normal = self.workspace_pill_visual(w, &icons, width, height, is_drop_target);
             let hovered = self.workspace_pill_visual(w, &icons, width, height, true);
             let btn = button(hover_switch(normal, hovered))
                 .width(Length::Fixed(width))
@@ -3690,8 +3893,21 @@ impl cosmic::Application for IcedWorkspacesApplet {
                         .into()
                 };
 
-            mouse_area(workspace_button)
-                .on_right_press(Message::TogglePopup)
+            let workspace_button =
+                mouse_area(workspace_button).on_right_press(Message::TogglePopup);
+            if !self.config.focus_windows_from_icons {
+                return workspace_button.into();
+            }
+
+            // Each pill accepts app icons dragged from the other pills.
+            let workspace = w.handle.id();
+            let (entered, left, dropped) = (workspace.clone(), workspace.clone(), workspace);
+            dnd_destination(workspace_button, vec![Cow::Borrowed(DRAGGED_ICON_MIME)])
+                // A stable id keeps the drop target valid while the view is rebuilt.
+                .drag_id(u64::from(w.handle.id().protocol_id()))
+                .on_enter(move |_, _, _| Message::DropTargetEntered(entered.clone()))
+                .on_leave(move || Message::DropTargetLeft(left.clone()))
+                .on_drop(move |_, _| Message::IconDropped(dropped.clone()))
                 .into()
         });
         // TODO if there is a popup_index, create a button with a popup for the remaining workspaces
@@ -3719,23 +3935,41 @@ impl cosmic::Application for IcedWorkspacesApplet {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            self.core
-                .watch_config::<WorkspacesAppletConfig>(config::APP_ID)
-                .map(|update| {
-                    for err in update.errors {
-                        tracing::error!(?err, "failed to load workspaces applet config update");
-                    }
-                    Message::ConfigUpdated(update.config)
-                }),
-            workspaces().map(Message::WorkspaceUpdate),
-            rectangle_tracker::subscription("app-icons")
-                .map(|(_, update)| Message::IconRectangle(update)),
+        // The applet learns that a drag ended only when the icon is dropped on
+        // the applet itself: the panel does not pass on the end of a drag that
+        // ends anywhere else (pop-os/cosmic-panel#712). The pointer reaches the
+        // applet only when no drag is in progress, so, while an icon is
+        // dragged, the pointer entering the applet or releasing a button there
+        // ends the drag.
+        let drag_end = self.dragged_icon.is_some().then(|| {
             event::listen_with(|e, _, _| match e {
-                Mouse(mouse::Event::WheelScrolled { delta }) => Some(Message::WheelScrolled(delta)),
+                Mouse(
+                    mouse::Event::CursorEntered | mouse::Event::ButtonReleased(mouse::Button::Left),
+                ) => Some(Message::PointerReturned),
                 _ => None,
-            }),
-        ])
+            })
+        });
+        Subscription::batch(
+            drag_end.into_iter().chain([
+                self.core
+                    .watch_config::<WorkspacesAppletConfig>(config::APP_ID)
+                    .map(|update| {
+                        for err in update.errors {
+                            tracing::error!(?err, "failed to load workspaces applet config update");
+                        }
+                        Message::ConfigUpdated(update.config)
+                    }),
+                workspaces().map(Message::WorkspaceUpdate),
+                rectangle_tracker::subscription("app-icons")
+                    .map(|(_, update)| Message::IconRectangle(update)),
+                event::listen_with(|e, _, _| match e {
+                    Mouse(mouse::Event::WheelScrolled { delta }) => {
+                        Some(Message::WheelScrolled(delta))
+                    }
+                    _ => None,
+                }),
+            ]),
+        )
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {

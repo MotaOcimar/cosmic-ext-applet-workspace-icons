@@ -32,7 +32,7 @@ use std::os::{
     unix::net::UnixStream,
 };
 use wayland_client::{
-    Connection, QueueHandle, WEnum,
+    Connection, Proxy, QueueHandle, WEnum,
     globals::registry_queue_init,
     protocol::{
         wl_output::{self, WlOutput},
@@ -46,7 +46,12 @@ pub enum WorkspaceEvent {
     /// Focuses a window, restoring it first if it is minimized.
     ActivateToplevel(ExtForeignToplevelHandleV1),
     MinimizeToplevel(ExtForeignToplevelHandleV1),
+    /// Moves a window to a workspace on the panel's output.
+    MoveToplevel(ExtForeignToplevelHandleV1, ExtWorkspaceHandleV1),
 }
+
+/// First toplevel manager version with `move_to_ext_workspace`.
+const MOVE_TO_EXT_WORKSPACE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceSnapshot {
@@ -120,6 +125,9 @@ pub fn spawn_workspaces(tx: mpsc::Sender<WorkspaceSnapshot>) -> SyncSender<Works
                     }
                     Event::Msg(WorkspaceEvent::MinimizeToplevel(handle)) => {
                         state.minimize_toplevel(&handle);
+                    }
+                    Event::Msg(WorkspaceEvent::MoveToplevel(handle, workspace)) => {
+                        state.move_toplevel(&handle, &workspace);
                     }
                     Event::Closed => {
                         if let Ok(workspace_manager) =
@@ -220,6 +228,25 @@ impl State {
         } else {
             tracing::warn!("cannot minimize window: toplevel management unavailable");
         }
+    }
+
+    fn move_toplevel(&self, handle: &ExtForeignToplevelHandleV1, workspace: &ExtWorkspaceHandleV1) {
+        let Some((manager, _, toplevel)) = self.managed_toplevel(handle) else {
+            tracing::warn!("cannot move window: toplevel management unavailable");
+            return;
+        };
+        if manager.version() < MOVE_TO_EXT_WORKSPACE_VERSION {
+            tracing::warn!(
+                version = manager.version(),
+                "cannot move window: toplevel manager too old"
+            );
+            return;
+        }
+        let Some(output) = self.expected_output.as_ref() else {
+            tracing::warn!("cannot move window: panel output unknown");
+            return;
+        };
+        manager.move_to_ext_workspace(toplevel, workspace, output);
     }
 
     pub fn workspace_list(&self) -> Vec<Workspace> {

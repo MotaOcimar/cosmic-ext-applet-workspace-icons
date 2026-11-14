@@ -35,6 +35,9 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         window_list: None,
         rectangle_tracker: None,
         icon_rectangles: HashMap::new(),
+        pressed_icon: None,
+        dragged_icon: None,
+        drop_target: None,
     }
 }
 
@@ -157,6 +160,46 @@ fn assert_near(a: f32, b: f32, context: &str) {
 }
 
 #[test]
+fn interactive_icons_survive_view_rebuilds() {
+    use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+
+    let temp = tempfile::tempdir().unwrap();
+    let icon_path = temp.path().join("symmetric.svg");
+    std::fs::write(&icon_path, SYMMETRIC_ICON).unwrap();
+    let metadata = AppMetadata {
+        name: "controlled".into(),
+        icon_source: fde::IconSource::Path(icon_path),
+    };
+    let workspace = fixture_workspace();
+    let mut app = fixture_app(Layout::Row, PanelSize::S, 40.0);
+    app.config.focus_windows_from_icons = true;
+    let icons = [WorkspaceIcon {
+        metadata: &metadata,
+        minimized: false,
+        maximized: false,
+        in_transit: false,
+        target: Some(IconTarget {
+            app_id: "controlled",
+            window: None,
+            window_count: 2,
+        }),
+    }];
+    let mut renderer = renderer();
+    let mut cache = Cache::default();
+
+    // The runtime moves named widget state between rebuilds; every rebuild must
+    // find the state each interactive icon expects.
+    for _ in 0..3 {
+        let pill = hover_switch(
+            app.workspace_pill_visual(&workspace, &icons, 80.0, 40.0, false),
+            app.workspace_pill_visual(&workspace, &icons, 80.0, 40.0, true),
+        );
+        let interface = UserInterface::build(pill, Size::new(200.0, 40.0), cache, &mut renderer);
+        cache = interface.into_cache();
+    }
+}
+
+#[test]
 fn calculated_button_size_matches_actual_overflow_layout() {
     let temp = tempfile::tempdir().unwrap();
     let icon_path = temp.path().join("symmetric.svg");
@@ -190,6 +233,7 @@ fn calculated_button_size_matches_actual_overflow_layout() {
                                 metadata: &metadata,
                                 minimized: false,
                                 maximized: highlighted[index.min(2)],
+                                in_transit: false,
                                 target: None,
                             })
                             .collect();
@@ -325,6 +369,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                     metadata: &metadata,
                     minimized: false,
                     maximized: false,
+                    in_transit: false,
                     target: None,
                 })
                 .collect();
@@ -333,6 +378,7 @@ fn highlights_beyond_the_visible_limit_do_not_change_visible_slots() {
                 metadata: &metadata,
                 minimized: false,
                 maximized: true,
+                in_transit: false,
                 target: None,
             });
             let after = probe(&app, &workspace, &icons, false, &renderer);
@@ -414,6 +460,7 @@ fn overflow_grows_by_its_natural_text_extent_without_changing_end_padding() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: *maximized,
+                            in_transit: false,
                             target: None,
                         })
                         .collect();
@@ -580,6 +627,7 @@ fn render_layout_samples_and_asset_bounds() {
                             metadata: &metadata,
                             minimized: false,
                             maximized: i == if variant == 0 { 0 } else { 2 },
+                            in_transit: false,
                             target: None,
                         })
                         .collect();
