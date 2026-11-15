@@ -1191,6 +1191,21 @@ fn highlighted(highlight: f32, look: impl Fn(bool) -> container::Style) -> conta
     }
 }
 
+/// A style with its text and icon colors `opacity` times as opaque.
+fn faded(style: container::Style, opacity: f32) -> container::Style {
+    let fade = |color: Option<Color>| {
+        color.map(|color| Color {
+            a: color.a * opacity,
+            ..color
+        })
+    };
+    container::Style {
+        text_color: fade(style.text_color),
+        icon_color: fade(style.icon_color),
+        ..style
+    }
+}
+
 fn workspace_overview_command(flatpak: bool) -> (&'static str, &'static [&'static str]) {
     if flatpak {
         ("flatpak-spawn", &["--host", "cosmic-workspaces"])
@@ -2616,9 +2631,6 @@ impl IcedWorkspacesApplet {
         hovered: bool,
     ) -> Element<'a, Message> {
         let horizontal = self.core.applet.is_horizontal();
-        let active = workspace
-            .state
-            .contains(ext_workspace_handle_v1::State::Active);
         let urgent = workspace
             .state
             .contains(ext_workspace_handle_v1::State::Urgent);
@@ -2627,8 +2639,8 @@ impl IcedWorkspacesApplet {
         let outlined_border_width = f32::from(self.config.pill_border_width);
         let inactive_brightness_percent = self.config.inactive_pill_brightness_percent;
         let show_numbers = self.config.show_workspace_numbers;
-        // Colors fade between the inactive and active looks; the layout and
-        // the symbol cutout follow the current state right away.
+        // Colors fade between the inactive and active looks; the layout follows
+        // the current state right away.
         let highlight = self.pill_highlight(workspace);
         let pill_look = move |theme: &Theme, active: bool| {
             Self::workspace_pill_style(
@@ -2733,13 +2745,20 @@ impl IcedWorkspacesApplet {
             is_last,
             show_empty_workspace_dot(inactive_pill_style, self.config.pill_border_width),
         );
-        let cutout = matches!(
+        let has_symbol = matches!(
             indicator,
             WorkspaceIndicator::Plus | WorkspaceIndicator::Empty
-        ) && workspace_symbol_is_cutout(active, inactive_pill_style, hovered);
+        );
+        // Where the inactive look cuts the symbol out of the fill, the hole
+        // stays until the pill looks fully active, and the active symbol fades
+        // in over it. Fading the symbol's own colors instead would start from
+        // the inactive text color, which the hole never showed.
+        let symbol_cut_out_when_inactive =
+            has_symbol && workspace_symbol_is_cutout(false, inactive_pill_style, hovered);
+        let cutout = symbol_cut_out_when_inactive && highlight < 1.0;
         let content: Element<'_, Message> = match indicator {
             WorkspaceIndicator::None => app_group,
-            WorkspaceIndicator::Plus | WorkspaceIndicator::Empty if cutout => {
+            WorkspaceIndicator::Plus | WorkspaceIndicator::Empty if cutout && highlight <= 0.0 => {
                 space::horizontal().into()
             }
             WorkspaceIndicator::Plus | WorkspaceIndicator::Empty => Element::new(WorkspaceSymbol {
@@ -2811,15 +2830,19 @@ impl IcedWorkspacesApplet {
         };
 
         // Unfilled symbols match the outline; active filled symbols keep their foreground.
-        let content = if matches!(
-            indicator,
-            WorkspaceIndicator::Plus | WorkspaceIndicator::Empty
-        ) {
+        let content = if has_symbol {
             container(content)
                 .class(ContainerClass::Custom(Box::new(move |theme| {
-                    highlighted(highlight, |active| {
-                        Self::workspace_symbol_style(pill_look(theme, active))
-                    })
+                    if symbol_cut_out_when_inactive {
+                        faded(
+                            Self::workspace_symbol_style(pill_look(theme, true)),
+                            highlight,
+                        )
+                    } else {
+                        highlighted(highlight, |active| {
+                            Self::workspace_symbol_style(pill_look(theme, active))
+                        })
+                    }
                 })))
                 .into()
         } else {
