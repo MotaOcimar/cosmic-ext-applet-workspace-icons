@@ -40,6 +40,7 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         dragged_icon: None,
         drop_target: None,
         pill_sizes: HashMap::new(),
+        pill_highlights: HashMap::new(),
         icon_flights: Vec::new(),
         icon_growths: HashMap::new(),
         icon_departures: Vec::new(),
@@ -936,4 +937,71 @@ fn render_layout_samples_and_asset_bounds() {
         "Visual samples and measurements written to {}",
         output.display()
     );
+}
+
+#[test]
+fn fades_a_pill_to_its_new_look_when_the_active_workspace_changes() {
+    let mut app = fixture_app(Layout::Row, PanelSize::M, 56.0);
+    app.workspaces = vec![fixture_workspace()];
+    app.animate_pill_highlights();
+    assert_eq!(app.pill_highlight(&app.workspaces[0]), 0.0);
+    assert!(!app.animating(), "a new pill starts with its look");
+
+    app.workspaces[0].state = ext_workspace_handle_v1::State::Active;
+    app.animate_pill_highlights();
+    let began = app.now;
+    assert!(app.animating());
+    for (elapsed, expected) in [(0, 0.0), (150, 0.5)] {
+        app.now = began + Duration::from_millis(elapsed);
+        let highlight = app.pill_highlight(&app.workspaces[0]);
+        assert!(
+            (highlight - expected).abs() < 1e-3,
+            "{elapsed} ms: {highlight}"
+        );
+    }
+    app.now = began + PILL_HIGHLIGHT_ANIMATION;
+    assert_eq!(app.pill_highlight(&app.workspaces[0]), 1.0);
+    assert!(!app.animating());
+
+    app.workspaces[0].state = ext_workspace_handle_v1::State::empty();
+    app.animate_pill_highlights();
+    let began = app.now;
+    assert!(app.animating());
+    app.now = began + PILL_HIGHLIGHT_ANIMATION;
+    assert_eq!(app.pill_highlight(&app.workspaces[0]), 0.0);
+}
+
+#[test]
+fn mixes_pill_looks_without_tinting_a_transparent_end() {
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    let half = mix_colors(Color::TRANSPARENT, red, 0.5);
+    assert_eq!((half.r, half.g, half.b, half.a), (1.0, 0.0, 0.0, 0.5));
+
+    let theme = Theme::default();
+    let look = |active: bool| {
+        IcedWorkspacesApplet::workspace_pill_style(
+            &theme,
+            active,
+            false,
+            false,
+            WorkspacePillStyle::Filled,
+            WorkspacePillStyle::Outlined,
+            1.0,
+            0,
+        )
+    };
+    assert_eq!(highlighted(0.0, look), look(false));
+    assert_eq!(highlighted(1.0, look), look(true));
+
+    // The outlined inactive pill has no fill, so the accent fill fades in
+    // with its own color.
+    let accent: Color = theme.cosmic().accent_button.base.into();
+    let Some(Background::Color(fill)) = highlighted(0.5, look).background else {
+        panic!("a pill halfway to active has a fill");
+    };
+    assert!((fill.r - accent.r).abs() < 1e-5);
+    assert!((fill.g - accent.g).abs() < 1e-5);
+    assert!((fill.b - accent.b).abs() < 1e-5);
+    assert!((fill.a - accent.a / 2.0).abs() < 1e-5);
+    assert_eq!(highlighted(0.5, look).border.width, 0.5);
 }

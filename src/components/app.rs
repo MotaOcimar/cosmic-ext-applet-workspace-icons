@@ -72,6 +72,8 @@ use std::{
 static AUTOSIZE_MAIN_ID: LazyLock<Id> = LazyLock::new(|| Id::new("autosize-main"));
 /// How long a workspace pill takes to grow or shrink to its new size.
 const PILL_SIZE_ANIMATION: Duration = Duration::from_millis(300);
+/// How long a workspace pill takes to take on or lose the active look.
+const PILL_HIGHLIGHT_ANIMATION: Duration = PILL_SIZE_ANIMATION;
 /// How long an app icon takes to fly to another pill or grow in. It matches
 /// the pill animation, so the icon lands as its pill finishes growing.
 const ICON_ANIMATION: Duration = PILL_SIZE_ANIMATION;
@@ -740,6 +742,9 @@ struct IcedWorkspacesApplet {
     drop_target: Option<ObjectId>,
     /// Major-axis size of each workspace pill, animated when it changes.
     pill_sizes: HashMap<ObjectId, Animation<f32>>,
+    /// Whether each workspace pill looks active, animated when the active
+    /// workspace changes.
+    pill_highlights: HashMap<ObjectId, Animation<bool>>,
     /// App icons flying to another pill after their windows moved there.
     icon_flights: Vec<IconFlight>,
     /// App icons growing into place after they appeared without coming from
@@ -1110,6 +1115,80 @@ fn inactive_pill_color(token: Srgba, brightness_percent: i8) -> Color {
         token.alpha,
     )
     .into()
+}
+
+/// Mixes two colors `t` of the way from `from` to `to`, weighting each by its
+/// alpha, so a transparent end fades the other color in or out without
+/// tinting it.
+fn mix_colors(from: Color, to: Color, t: f32) -> Color {
+    let alpha = from.a + (to.a - from.a) * t;
+    if alpha <= f32::EPSILON {
+        return Color::TRANSPARENT;
+    }
+    let channel = |from_channel: f32, to_channel: f32| {
+        (from_channel * from.a * (1.0 - t) + to_channel * to.a * t) / alpha
+    };
+    Color {
+        r: channel(from.r, to.r),
+        g: channel(from.g, to.g),
+        b: channel(from.b, to.b),
+        a: alpha,
+    }
+}
+
+/// Mixes the colors of two styles `t` of the way from `from` to `to`. An unset
+/// color counts as transparent, so a style that inherits a color must have it
+/// filled in first.
+fn mix_styles(from: container::Style, to: container::Style, t: f32) -> container::Style {
+    if t <= 0.0 {
+        return from;
+    }
+    if t >= 1.0 {
+        return to;
+    }
+    let mix = |from: Option<Color>, to: Option<Color>| match (from, to) {
+        (None, None) => None,
+        (from, to) => Some(mix_colors(
+            from.unwrap_or(Color::TRANSPARENT),
+            to.unwrap_or(Color::TRANSPARENT),
+            t,
+        )),
+    };
+    let color = |background: Option<Background>| match background {
+        None => Some(None),
+        Some(Background::Color(color)) => Some(Some(color)),
+        Some(_) => None,
+    };
+    let background = match (color(from.background), color(to.background)) {
+        (Some(from), Some(to)) => mix(from, to).map(Background::Color),
+        // Gradients do not mix; switch halfway.
+        _ if t < 0.5 => from.background,
+        _ => to.background,
+    };
+    let nearest = if t < 0.5 { from } else { to };
+    container::Style {
+        text_color: mix(from.text_color, to.text_color),
+        icon_color: mix(from.icon_color, to.icon_color),
+        background,
+        border: Border {
+            color: mix_colors(from.border.color, to.border.color, t),
+            width: from.border.width + (to.border.width - from.border.width) * t,
+            radius: nearest.border.radius,
+        },
+        ..nearest
+    }
+}
+
+/// The style of a pill part `highlight` of the way from its inactive look
+/// (`look(false)`) to its active one (`look(true)`).
+fn highlighted(highlight: f32, look: impl Fn(bool) -> container::Style) -> container::Style {
+    if highlight <= 0.0 {
+        look(false)
+    } else if highlight >= 1.0 {
+        look(true)
+    } else {
+        mix_styles(look(false), look(true), highlight)
+    }
 }
 
 fn workspace_overview_command(flatpak: bool) -> (&'static str, &'static [&'static str]) {
@@ -1589,6 +1668,60 @@ impl IcedWorkspacesApplet {
         }
     }
 
+    /// Fades each pill to its active or inactive look when the active
+    /// workspace changes. New pills start with their look, without animating.
+    fn animate_pill_highlights(&mut self) {
+        let states = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    w.handle.id(),
+                    w.state.contains(ext_workspace_handle_v1::State::Active),
+                )
+            })
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut started = false;
+        self.pill_highlights
+            .retain(|id, _| states.iter().any(|(state_id, _)| state_id == id));
+        for (id, active) in states {
+            match self.pill_highlights.get_mut(&id) {
+                Some(highlight) if highlight.value() != active => {
+                    highlight.go_mut(active, now);
+                    started = true;
+                }
+                Some(_) => {}
+                None => {
+                    self.pill_highlights.insert(
+                        id,
+                        Animation::new(active)
+                            .duration(PILL_HIGHLIGHT_ANIMATION)
+                            .easing(Easing::EaseInOutCubic),
+                    );
+                }
+            }
+        }
+        if started {
+            self.now = now;
+        }
+    }
+
+    /// How far a pill is from its inactive look (0) to its active one (1),
+    /// falling back to its current state when no animation tracks it yet.
+    fn pill_highlight(&self, workspace: &Workspace) -> f32 {
+        let active = workspace
+            .state
+            .contains(ext_workspace_handle_v1::State::Active);
+        match self.pill_highlights.get(&workspace.handle.id()) {
+            Some(highlight) if highlight.value() == active => {
+                highlight.interpolate(0.0, 1.0, self.now)
+            }
+            _ if active => 1.0,
+            _ => 0.0,
+        }
+    }
+
     /// The pill size to draw now, falling back to `target` when no animation
     /// tracks it yet.
     fn pill_major_size(&self, workspace: &Workspace, target: f32) -> f32 {
@@ -1602,6 +1735,10 @@ impl IcedWorkspacesApplet {
         self.pill_sizes
             .values()
             .any(|size| size.is_animating(self.now))
+            || self
+                .pill_highlights
+                .values()
+                .any(|highlight| highlight.is_animating(self.now))
             || self
                 .icon_flights
                 .iter()
@@ -2490,6 +2627,34 @@ impl IcedWorkspacesApplet {
         let outlined_border_width = f32::from(self.config.pill_border_width);
         let inactive_brightness_percent = self.config.inactive_pill_brightness_percent;
         let show_numbers = self.config.show_workspace_numbers;
+        // Colors fade between the inactive and active looks; the layout and
+        // the symbol cutout follow the current state right away.
+        let highlight = self.pill_highlight(workspace);
+        let pill_look = move |theme: &Theme, active: bool| {
+            Self::workspace_pill_style(
+                theme,
+                active,
+                urgent,
+                hovered,
+                pill_style,
+                inactive_pill_style,
+                outlined_border_width,
+                inactive_brightness_percent,
+            )
+        };
+        let indicator_look = move |theme: &Theme, active: bool| {
+            let style = Self::workspace_indicator_style(theme, active, pill_style, hovered);
+            // Fill in the colors it inherits from the pill, so the looks can mix.
+            let pill = pill_look(theme, active);
+            container::Style {
+                text_color: style.text_color.or(pill.text_color),
+                icon_color: style.icon_color.or(pill.icon_color),
+                ..style
+            }
+        };
+        let divider_look = move |theme: &Theme, active: bool| {
+            Self::workspace_divider_style(theme, active, urgent, pill_style, hovered)
+        };
         let pill_cross_axis_inset = if horizontal {
             height * f32::from(self.config.pill_spacing_percent) / 100.0
         } else {
@@ -2526,7 +2691,7 @@ impl IcedWorkspacesApplet {
                         .height(size.height),
                 )
                 .class(ContainerClass::Custom(Box::new(move |theme| {
-                    Self::workspace_indicator_style(theme, active, pill_style, hovered)
+                    highlighted(highlight, |active| indicator_look(theme, active))
                 })))
                 .into(),
             );
@@ -2598,7 +2763,7 @@ impl IcedWorkspacesApplet {
                 .center();
                 let number =
                     container(number_text).class(ContainerClass::Custom(Box::new(move |theme| {
-                        Self::workspace_indicator_style(theme, active, pill_style, hovered)
+                        highlighted(highlight, |active| indicator_look(theme, active))
                     })));
                 let number: Element<'_, Message> = if horizontal {
                     number
@@ -2620,9 +2785,7 @@ impl IcedWorkspacesApplet {
                         container(space::vertical().height(Length::Fixed(icon_size * 0.8)))
                             .width(Length::Fixed(WORKSPACE_DIVIDER_WIDTH))
                             .class(ContainerClass::Custom(Box::new(move |theme| {
-                                Self::workspace_divider_style(
-                                    theme, active, urgent, pill_style, hovered,
-                                )
+                                highlighted(highlight, |active| divider_look(theme, active))
                             })))
                             .into();
 
@@ -2635,9 +2798,7 @@ impl IcedWorkspacesApplet {
                         container(space::horizontal().width(Length::Fixed(icon_size * 0.8)))
                             .height(Length::Fixed(WORKSPACE_DIVIDER_WIDTH))
                             .class(ContainerClass::Custom(Box::new(move |theme| {
-                                Self::workspace_divider_style(
-                                    theme, active, urgent, pill_style, hovered,
-                                )
+                                highlighted(highlight, |active| divider_look(theme, active))
                             })))
                             .into();
 
@@ -2656,16 +2817,9 @@ impl IcedWorkspacesApplet {
         ) {
             container(content)
                 .class(ContainerClass::Custom(Box::new(move |theme| {
-                    Self::workspace_symbol_style(Self::workspace_pill_style(
-                        theme,
-                        active,
-                        urgent,
-                        hovered,
-                        pill_style,
-                        inactive_pill_style,
-                        outlined_border_width,
-                        inactive_brightness_percent,
-                    ))
+                    highlighted(highlight, |active| {
+                        Self::workspace_symbol_style(pill_look(theme, active))
+                    })
                 })))
                 .into()
         } else {
@@ -2693,16 +2847,7 @@ impl IcedWorkspacesApplet {
             container(Element::new(WorkspacePillBackground {
                 cutout: cutout.then_some((indicator, f32::from(icon_size as u16))),
                 style: Box::new(move |theme| {
-                    let mut style = Self::workspace_pill_style(
-                        theme,
-                        active,
-                        urgent,
-                        hovered,
-                        pill_style,
-                        inactive_pill_style,
-                        outlined_border_width,
-                        inactive_brightness_percent,
-                    );
+                    let mut style = highlighted(highlight, |active| pill_look(theme, active));
                     if !show_numbers {
                         style.border.radius = workspace_pill_radii(
                             theme.cosmic().radius_xl(),
@@ -2728,16 +2873,7 @@ impl IcedWorkspacesApplet {
 
         let pill_content: Element<'_, Message> = container(content)
             .class(ContainerClass::Custom(Box::new(move |theme| {
-                let pill_style = Self::workspace_pill_style(
-                    theme,
-                    active,
-                    urgent,
-                    hovered,
-                    pill_style,
-                    inactive_pill_style,
-                    outlined_border_width,
-                    inactive_brightness_percent,
-                );
+                let pill_style = highlighted(highlight, |active| pill_look(theme, active));
                 container::Style {
                     text_color: pill_style.text_color,
                     icon_color: pill_style.icon_color,
@@ -4453,6 +4589,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             dragged_icon: None,
             drop_target: None,
             pill_sizes: HashMap::new(),
+            pill_highlights: HashMap::new(),
             icon_flights: Vec::new(),
             icon_growths: HashMap::new(),
             icon_departures: Vec::new(),
@@ -4480,6 +4617,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
         let drawn_before = self.drawn_pill_icons();
         let task = self.handle_message(message);
         self.animate_pill_sizes();
+        self.animate_pill_highlights();
         self.animate_departures(&drawn_before);
         task
     }
