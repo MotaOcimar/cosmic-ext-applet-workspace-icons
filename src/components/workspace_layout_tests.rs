@@ -44,6 +44,7 @@ fn fixture_app(layout: Layout, panel_size: PanelSize, cross: f32) -> IcedWorkspa
         icon_flights: Vec::new(),
         icon_growths: HashMap::new(),
         icon_departures: Vec::new(),
+        icon_arrivals: Vec::new(),
         icon_shrinks: Vec::new(),
         now: Instant::now(),
     }
@@ -331,6 +332,107 @@ fn kept_icons_hold_their_place_while_a_departure_gap_closes() {
                             - end(*before.strip_children.last().unwrap(), layout),
                         &format!("icon after the gap keeps its distance to the end: {context}"),
                     );
+                }
+            }
+        }
+    }
+}
+
+/// While the slot of an icon that arrived in a pill opens, the icons already
+/// there slide aside from where they were: those before the new icon stay
+/// put, and those after it keep their distance to the pill's end, wherever
+/// the new icon lands.
+#[test]
+fn kept_icons_slide_aside_while_an_arriving_icon_opens_its_slot() {
+    let temp = tempfile::tempdir().unwrap();
+    let icon_path = temp.path().join("symmetric.svg");
+    std::fs::write(&icon_path, SYMMETRIC_ICON).unwrap();
+    let metadata = Arc::new(AppMetadata {
+        name: "controlled".into(),
+        icon_source: fde::IconSource::Path(icon_path),
+    });
+    let icon = |app_id: &'static str| WorkspaceIcon {
+        metadata: &metadata,
+        minimized: false,
+        maximized: false,
+        in_transit: false,
+        target: Some(IconTarget {
+            app_id,
+            window: None,
+            window_count: 1,
+        }),
+    };
+    let workspace = fixture_workspace();
+    let renderer = renderer();
+    let end = |rect: Rectangle, layout: Layout| start(rect, layout) + major(rect, layout);
+    let kept = [icon("a"), icon("b")];
+    for layout in [Layout::Row, Layout::Column] {
+        let mut app = fixture_app(layout, PanelSize::M, 56.0);
+        for numbers in [false, true] {
+            app.config.show_workspace_numbers = numbers;
+            let before = probe(&app, &workspace, &kept, false, &renderer);
+            for arrival in 0..=kept.len() {
+                let mut icons = kept.to_vec();
+                icons.insert(arrival, icon("new"));
+                let start_size = app.workspace_button_major_size(&kept);
+                let target = app.workspace_button_major_size(&icons);
+                let began = Instant::now();
+                app.pill_sizes.insert(
+                    workspace.handle.id(),
+                    Animation::new(start_size)
+                        .duration(PILL_SIZE_ANIMATION)
+                        .easing(Easing::EaseInOutCubic)
+                        .go(target, began),
+                );
+                app.icon_arrivals = vec![IconArrival {
+                    workspace: workspace.handle.id(),
+                    id: AppIconId {
+                        workspace: workspace.handle.id(),
+                        app_id: "new".into(),
+                        window: None,
+                    },
+                    size: app.app_icon_size() + APP_ICON_SPACING,
+                }];
+                for elapsed in [1, 75, 150, 225, 270] {
+                    app.now = began + Duration::from_millis(elapsed);
+                    let pill = app.pill_major_size(&workspace, target);
+                    let during = probe_sized(&app, &workspace, &icons, pill, false, &renderer);
+                    let context = format!(
+                        "{layout:?}, numbers={numbers}, arrival at {arrival}, {elapsed} ms"
+                    );
+                    assert!(pill < target, "pill still growing: {context}");
+                    // A row leaves out a child of zero size, so a slot that has
+                    // not opened at all is missing from the strip.
+                    let mut kept_items = during.items.clone();
+                    if kept_items.len() > before.items.len() {
+                        kept_items.remove(arrival);
+                    }
+                    assert_eq!(kept_items.len(), before.items.len(), "{context}");
+                    for (index, kept_rect) in before.items.iter().enumerate() {
+                        let during_rect = kept_items[index];
+                        assert_near(
+                            major(during_rect, layout),
+                            major(*kept_rect, layout),
+                            &format!("kept icon {index} keeps its size: {context}"),
+                        );
+                        if index < arrival {
+                            assert_near(
+                                start(during_rect, layout),
+                                start(*kept_rect, layout),
+                                &format!(
+                                    "kept icon {index} before the new one stays put: {context}"
+                                ),
+                            );
+                        } else {
+                            assert_near(
+                                end(during.button, layout) - end(during_rect, layout),
+                                end(before.button, layout) - end(*kept_rect, layout),
+                                &format!(
+                                    "kept icon {index} after the new one keeps its distance to the end: {context}"
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }

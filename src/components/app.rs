@@ -446,6 +446,14 @@ fn remaining_shrink(size: &Animation<f32>, now: Instant) -> f32 {
     (size.interpolate_with(|v| v, now) - size.value()).max(0.0)
 }
 
+/// How much smaller than its target size a growing pill is drawn at `now`.
+fn remaining_growth(size: &Animation<f32>, now: Instant) -> f32 {
+    if !size.is_animating(now) {
+        return 0.0;
+    }
+    (size.value() - size.interpolate_with(|v| v, now)).max(0.0)
+}
+
 fn workspace_edge_padding(show_numbers: bool, cross_size: f32, largest_icon_slot: f32) -> f32 {
     if show_numbers {
         WORKSPACE_CONTENT_PADDING
@@ -752,6 +760,9 @@ struct IcedWorkspacesApplet {
     icon_growths: HashMap<AppIconId, Animation<bool>>,
     /// Gaps left by app icons that left their pills, closing as the pills shrink.
     icon_departures: Vec<IconDeparture>,
+    /// Slots of app icons that arrived in pills with other icons, opening as
+    /// the pills grow.
+    icon_arrivals: Vec<IconArrival>,
     /// App icons shrinking away where they were drawn, after their pills emptied.
     icon_shrinks: Vec<IconShrink>,
     /// Time used to sample the animations, advanced on every frame.
@@ -791,6 +802,18 @@ struct IconDeparture {
     size: f32,
     /// Drawn shrinking in the gap, unless it flew to another pill.
     icon: Option<DrawnIcon>,
+}
+
+/// An app icon that arrived in a pill that kept some of its icons. Its slot
+/// opens while the pill grows, so the icons already there slide aside instead
+/// of jumping a slot over. Without it, the pill's row would squeeze its last
+/// icon to fit, so an icon arriving before the others would push the last one
+/// out and make it grow back.
+struct IconArrival {
+    workspace: ObjectId,
+    id: AppIconId,
+    /// The icon's slot and the spacing next to it: what the opening ends at.
+    size: f32,
 }
 
 /// An app icon that left a pill now empty, without flying to another pill.
@@ -1992,11 +2015,16 @@ impl IcedWorkspacesApplet {
     }
 
     /// Leaves a closing gap where each app icon that left a pill was drawn,
-    /// given what the pills drew before the update. A pill that kept none of
-    /// its icons gets no gap, since no icon there has a place to keep.
-    fn animate_departures(&mut self, before: &[(ObjectId, Vec<DrawnIcon>)]) {
-        for (workspace, icons_after) in self.drawn_pill_icons() {
-            let Some((_, icons_before)) = before.iter().find(|(id, _)| *id == workspace) else {
+    /// given what the pills drew before and after the update. A pill that
+    /// kept none of its icons gets no gap, since no icon there has a place to
+    /// keep.
+    fn animate_departures(
+        &mut self,
+        before: &[(ObjectId, Vec<DrawnIcon>)],
+        after: &[(ObjectId, Vec<DrawnIcon>)],
+    ) {
+        for (workspace, icons_after) in after {
+            let Some((_, icons_before)) = before.iter().find(|(id, _)| id == workspace) else {
                 continue;
             };
             let kept = icons_before
@@ -2009,7 +2037,7 @@ impl IcedWorkspacesApplet {
             for departure in self
                 .icon_departures
                 .iter_mut()
-                .filter(|departure| departure.workspace == workspace)
+                .filter(|departure| departure.workspace == *workspace)
             {
                 departure.index = kept_before(departure.index);
             }
@@ -2031,7 +2059,7 @@ impl IcedWorkspacesApplet {
                     .any(|flight| flight.origin == icon.id);
                 if emptied {
                     if !flew {
-                        self.shrink_away(&workspace, icon);
+                        self.shrink_away(workspace, icon);
                     }
                     continue;
                 }
@@ -2048,6 +2076,45 @@ impl IcedWorkspacesApplet {
             pill_sizes
                 .get(&departure.workspace)
                 .is_some_and(|size| remaining_shrink(size, now) > 0.0)
+        });
+    }
+
+    /// Opens a slot for each app icon that arrived in a pill, given what the
+    /// pills drew before and after the update. As with departures, a pill
+    /// that kept none of its icons, because it was empty or a setting
+    /// regrouped them, gets no slot: no icon there has a place to keep.
+    fn animate_arrivals(
+        &mut self,
+        before: &[(ObjectId, Vec<DrawnIcon>)],
+        after: &[(ObjectId, Vec<DrawnIcon>)],
+    ) {
+        for (workspace, icons_after) in after {
+            let Some((_, icons_before)) = before.iter().find(|(id, _)| id == workspace) else {
+                continue;
+            };
+            let arrived = |icon: &&DrawnIcon| !icons_before.iter().any(|kept| kept.id == icon.id);
+            if icons_after.iter().all(|icon| arrived(&icon)) {
+                continue;
+            }
+            for icon in icons_after.iter().filter(arrived) {
+                self.icon_arrivals.push(IconArrival {
+                    workspace: workspace.clone(),
+                    id: icon.id.clone(),
+                    size: icon.slot + APP_ICON_SPACING,
+                });
+            }
+        }
+        let (pill_sizes, now) = (&self.pill_sizes, self.now);
+        let drawn = |arrival: &IconArrival| {
+            after.iter().any(|(workspace, icons)| {
+                *workspace == arrival.workspace && icons.iter().any(|icon| icon.id == arrival.id)
+            })
+        };
+        self.icon_arrivals.retain(|arrival| {
+            drawn(arrival)
+                && pill_sizes
+                    .get(&arrival.workspace)
+                    .is_some_and(|size| remaining_growth(size, now) > 0.0)
         });
     }
 
@@ -2076,11 +2143,13 @@ impl IcedWorkspacesApplet {
 
     /// Puts the spacing between the elements of a pill's icon strip, and the
     /// gaps of the icons that left it. Each gap holds the spacing next to it,
-    /// so the icons end up spaced as usual when it closes.
-    fn spaced_with_departure_gaps<'a>(
+    /// so the icons end up spaced as usual when it closes. An element with a
+    /// slot size is an icon that just arrived: its slot and one spacing next
+    /// to it open together.
+    fn spaced_with_gaps<'a>(
         &'a self,
         workspace: &Workspace,
-        elements: Vec<Element<'a, Message>>,
+        elements: Vec<(Element<'a, Message>, Option<f32>)>,
     ) -> Vec<Element<'a, Message>> {
         let workspace_id = workspace.handle.id();
         let departures = self
@@ -2103,7 +2172,31 @@ impl IcedWorkspacesApplet {
         } else {
             0.0
         };
+        // Likewise, the arriving icons share what the pill has grown so far,
+        // so the icons already there slide aside as their slots open.
+        let arrived_size = self
+            .icon_arrivals
+            .iter()
+            .filter(|arrival| arrival.workspace == workspace_id)
+            .map(|arrival| arrival.size)
+            .sum::<f32>();
+        let growth = self
+            .pill_sizes
+            .get(&workspace_id)
+            .map_or(0.0, |size| remaining_growth(size, self.now));
+        let opened = if arrived_size > 0.0 {
+            (1.0 - growth / arrived_size).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let count = elements.len();
+        // An arriving icon opens the spacing after it while only arriving
+        // icons come before it, and the one before it otherwise, so each
+        // opens exactly one.
+        let leading_arrivals = elements
+            .iter()
+            .take_while(|(_, arriving)| arriving.is_some())
+            .count();
         let mut strip = Vec::new();
         let push_gaps = |strip: &mut Vec<Element<'a, Message>>, index: usize| {
             for departure in &departures {
@@ -2112,22 +2205,36 @@ impl IcedWorkspacesApplet {
                 }
             }
         };
-        for (index, element) in elements.into_iter().enumerate() {
+        for (index, (element, arriving)) in elements.into_iter().enumerate() {
             push_gaps(&mut strip, index);
             if index > 0 {
+                let opening = index <= leading_arrivals || arriving.is_some();
+                let spacing = APP_ICON_SPACING * if opening { opened } else { 1.0 };
                 strip.push(match self.layout {
-                    Layout::Row => space::horizontal()
-                        .width(Length::Fixed(APP_ICON_SPACING))
-                        .into(),
-                    Layout::Column => space::vertical()
-                        .height(Length::Fixed(APP_ICON_SPACING))
-                        .into(),
+                    Layout::Row => space::horizontal().width(Length::Fixed(spacing)).into(),
+                    Layout::Column => space::vertical().height(Length::Fixed(spacing)).into(),
                 });
             }
-            strip.push(element);
+            strip.push(match arriving {
+                Some(slot) => self.opening_slot(element, slot * opened),
+                None => element,
+            });
         }
         push_gaps(&mut strip, count);
         strip
+    }
+
+    /// An arriving icon in a slot `size` long that opens with its pill. The
+    /// icon fits itself to the slot, shrunk while the slot is small.
+    fn opening_slot<'a>(&self, icon: Element<'a, Message>, size: f32) -> Element<'a, Message> {
+        let slot = container(icon)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center);
+        match self.layout {
+            Layout::Row => slot.width(Length::Fixed(size)),
+            Layout::Column => slot.height(Length::Fixed(size)),
+        }
+        .into()
     }
 
     /// The gap an app icon left in its pill, at `scale` times its starting
@@ -2681,8 +2788,13 @@ impl IcedWorkspacesApplet {
             .take(visible_icon_count)
             .zip(self.visible_icon_slot_sizes(icons))
             .map(|(icon, slot_size)| {
-                let reveal =
-                    icon_id(workspace, icon).map_or(IconReveal::FULL, |id| self.icon_reveal(&id));
+                let id = icon_id(workspace, icon);
+                let reveal = id
+                    .as_ref()
+                    .map_or(IconReveal::FULL, |id| self.icon_reveal(id));
+                let arriving = id
+                    .as_ref()
+                    .is_some_and(|id| self.icon_arrivals.iter().any(|arrival| arrival.id == *id));
                 let element = self.app_icon(
                     icon.metadata,
                     icon_size,
@@ -2691,12 +2803,15 @@ impl IcedWorkspacesApplet {
                     slot_size,
                     reveal,
                 );
-                self.clickable_icon(workspace, icon, element)
+                (
+                    self.clickable_icon(workspace, icon, element),
+                    arriving.then_some(slot_size),
+                )
             })
             .collect::<Vec<_>>();
         if overflow_count > 0 {
             let size = workspace_overflow_size(&self.core.applet, icon_size, overflow_count);
-            icon_elements.push(
+            icon_elements.push((
                 container(
                     workspace_overflow_text(&self.core.applet, icon_size, overflow_count)
                         .width(size.width)
@@ -2706,9 +2821,10 @@ impl IcedWorkspacesApplet {
                     highlighted(highlight, |active| indicator_look(theme, active))
                 })))
                 .into(),
-            );
+                None,
+            ));
         }
-        let icon_elements = self.spaced_with_departure_gaps(workspace, icon_elements);
+        let icon_elements = self.spaced_with_gaps(workspace, icon_elements);
         let app_strip: Element<'_, Message> = if horizontal {
             row(icon_elements).align_y(Alignment::Center).into()
         } else {
@@ -4616,6 +4732,7 @@ impl cosmic::Application for IcedWorkspacesApplet {
             icon_flights: Vec::new(),
             icon_growths: HashMap::new(),
             icon_departures: Vec::new(),
+            icon_arrivals: Vec::new(),
             icon_shrinks: Vec::new(),
             now: Instant::now(),
         };
@@ -4641,7 +4758,9 @@ impl cosmic::Application for IcedWorkspacesApplet {
         let task = self.handle_message(message);
         self.animate_pill_sizes();
         self.animate_pill_highlights();
-        self.animate_departures(&drawn_before);
+        let drawn_after = self.drawn_pill_icons();
+        self.animate_departures(&drawn_before, &drawn_after);
+        self.animate_arrivals(&drawn_before, &drawn_after);
         task
     }
 
