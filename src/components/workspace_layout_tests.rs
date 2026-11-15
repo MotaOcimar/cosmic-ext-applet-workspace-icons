@@ -479,6 +479,119 @@ fn interactive_icons_survive_view_rebuilds() {
     }
 }
 
+/// A rectangle tracker like the one the applet gets from its subscription,
+/// which hands it out before any rectangle is reported.
+fn rectangle_tracker() -> RectangleTracker<AppIconId> {
+    use cosmic::iced::advanced::subscription::into_recipes;
+    use cosmic::iced::futures::{StreamExt, stream};
+
+    let recipe = into_recipes(rectangle_tracker::subscription::<_, AppIconId>("test"))
+        .pop()
+        .unwrap();
+    let mut updates = recipe.stream(stream::empty().boxed());
+    let first = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(updates.next());
+    match first {
+        Some((_, RectangleUpdate::Init(tracker))) => tracker,
+        _ => panic!("the subscription starts with its tracker"),
+    }
+}
+
+/// An icon's widget state stays with the icon when the strip around it
+/// changes shape, as when an icon leaves and a gap closes where it was.
+/// iced matches state to widgets by position and type: the rectangle tracker
+/// has no type of its own, like a spacer, so a tracked icon landing where a
+/// spacer was must still get its own tooltip state, or the tooltip panics the
+/// next time it reads it, such as when the cursor leaves the panel.
+#[test]
+fn tracked_icons_keep_their_state_when_an_icon_leaves() {
+    use cosmic::iced::advanced::clipboard;
+    use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+
+    let temp = tempfile::tempdir().unwrap();
+    let icon_path = temp.path().join("symmetric.svg");
+    std::fs::write(&icon_path, SYMMETRIC_ICON).unwrap();
+    let metadata = Arc::new(AppMetadata {
+        name: "controlled".into(),
+        icon_source: fde::IconSource::Path(icon_path),
+    });
+    let icon = |app_id: &'static str| WorkspaceIcon {
+        metadata: &metadata,
+        minimized: false,
+        maximized: false,
+        in_transit: false,
+        target: Some(IconTarget {
+            app_id,
+            window: None,
+            window_count: 1,
+        }),
+    };
+    let workspace = fixture_workspace();
+    let kept = [icon("a"), icon("b")];
+    let mut renderer = renderer();
+    for leaving in 0..=kept.len() {
+        let mut app = fixture_app(Layout::Row, PanelSize::S, 40.0);
+        app.config.focus_windows_from_icons = true;
+        app.config.show_workspace_numbers = false;
+        app.rectangle_tracker = Some(rectangle_tracker());
+        let mut before = kept.to_vec();
+        before.insert(leaving, icon("leaving"));
+        let cross = app.workspace_cross_axis_size();
+        let full = app.workspace_button_major_size(&before);
+        let target = app.workspace_button_major_size(&kept);
+
+        let pill = app.workspace_pill_visual(&workspace, &before, full, cross, false);
+        let interface = UserInterface::build(
+            pill,
+            Size::new(300.0, cross),
+            Cache::default(),
+            &mut renderer,
+        );
+        let cache = interface.into_cache();
+
+        let began = Instant::now();
+        app.pill_sizes.insert(
+            workspace.handle.id(),
+            Animation::new(full)
+                .duration(PILL_SIZE_ANIMATION)
+                .easing(Easing::EaseInOutCubic)
+                .go(target, began),
+        );
+        app.icon_departures = vec![IconDeparture {
+            workspace: workspace.handle.id(),
+            index: leaving,
+            size: app.app_icon_size() + APP_ICON_SPACING,
+            icon: Some(DrawnIcon {
+                id: AppIconId {
+                    workspace: workspace.handle.id(),
+                    app_id: "leaving".into(),
+                    window: None,
+                },
+                slot: app.app_icon_size(),
+                metadata: metadata.clone(),
+                dimmed: false,
+            }),
+        }];
+        app.now = began + Duration::from_millis(1);
+        let size = app.pill_major_size(&workspace, target);
+        let pill = app.workspace_pill_visual(&workspace, &kept, size, cross, false);
+        let mut interface =
+            UserInterface::build(pill, Size::new(300.0, cross), cache, &mut renderer);
+        let mut messages = Vec::new();
+        let _ = interface.update(
+            &[cosmic::iced::Event::Mouse(
+                cosmic::iced::mouse::Event::CursorLeft,
+            )],
+            cosmic::iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+    }
+}
+
 #[test]
 fn calculated_button_size_matches_actual_overflow_layout() {
     let temp = tempfile::tempdir().unwrap();

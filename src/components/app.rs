@@ -2606,6 +2606,11 @@ impl IcedWorkspacesApplet {
         let element = mouse_area(element)
             .on_press(Message::AppIconPressed(id.clone()))
             .on_release(Message::AppIconReleased(id.clone()));
+        // Tracked inside the tooltip, which then sits at the root. The tracker
+        // has no state type of its own, like the spacers between icons, so at
+        // the root an icon could take over a spacer's empty state when the
+        // strip changes shape, and its tooltip would panic reading it.
+        let element = self.track_icon(id.clone(), element);
         let drag_icon = icon.metadata.icon_source.as_cosmic_icon();
         let drag_icon_size = self.app_icon_size().round() as u16;
         // Keep the automatic id: the tree carries it across rebuilds. A named id
@@ -2637,14 +2642,16 @@ impl IcedWorkspacesApplet {
         if let Some(window) = self.core.main_window_id() {
             element = element.window(window);
         }
-        let icon = self.core.applet.applet_tooltip(
-            element,
-            app_summary(&icon.metadata.name, target.window_count),
-            self.popup.is_some() || self.window_list.is_some(),
-            Message::Surface,
-            None,
-        );
-        self.track_icon(id, icon)
+        self.core
+            .applet
+            .applet_tooltip(
+                element,
+                app_summary(&icon.metadata.name, target.window_count),
+                self.popup.is_some() || self.window_list.is_some(),
+                Message::Surface,
+                None,
+            )
+            .into()
     }
 
     /// Reports where the icon is drawn, for popups anchored to it and for
