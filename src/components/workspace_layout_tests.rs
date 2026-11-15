@@ -1,6 +1,9 @@
 use super::*;
 use crate::wayland::WorkspaceSnapshot;
-use cctk::wayland_client::{Connection, Proxy};
+use cctk::wayland_client::{
+    Connection, Dispatch, Proxy, QueueHandle,
+    protocol::wl_registry::{self, WlRegistry},
+};
 use cosmic::applet::cosmic_panel_config::PanelSize;
 use cosmic::iced::{Font, Pixels, Point};
 use std::os::unix::net::UnixStream;
@@ -257,6 +260,134 @@ fn closed_apps_shrink_away() {
         "a shrinks away above the empty pill"
     );
     assert!(app.animating(), "frames keep coming while a shrinks");
+}
+
+struct BindState;
+
+impl Dispatch<WlRegistry, ()> for BindState {
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtWorkspaceHandleV1, ()> for BindState {
+    fn event(
+        _: &mut Self,
+        _: &ExtWorkspaceHandleV1,
+        _: ext_workspace_handle_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// Workspaces whose handles have distinct ids, unlike inert handles, which
+/// all share the null id. Binding them through the registry makes
+/// client-side objects that no server ever sees.
+fn distinct_workspaces(connection: &Connection, count: u32) -> Vec<Workspace> {
+    let queue = connection.new_event_queue::<BindState>();
+    let registry = connection.display().get_registry(&queue.handle(), ());
+    (1..=count)
+        .map(|name| {
+            let handle = registry.bind::<ExtWorkspaceHandleV1, _, _>(name, 1, &queue.handle(), ());
+            Workspace {
+                handle,
+                name: name.to_string(),
+                coordinates: vec![name],
+                ..fixture_workspace()
+            }
+        })
+        .collect()
+}
+
+/// An icon dragged over another pill grows in there, as a new icon would,
+/// whether the pill is empty (with numbers hidden, the same size as with one
+/// icon, so the pill does not grow) or already has icons. When the drag
+/// moves on before it finishes growing, it shrinks away from the size it
+/// reached instead of first jumping to its full size.
+#[test]
+fn drag_previews_grow_in_and_shrink_from_where_they_were() {
+    let (client, _server) = UnixStream::pair().unwrap();
+    let connection = Connection::from_socket(client).unwrap();
+    for target_apps in [&[][..], &["b"][..]] {
+        let mut app = fixture_app(Layout::Row, PanelSize::M, 56.0);
+        app.config.show_one_icon_per_application = true;
+        app.config.show_workspace_numbers = false;
+        let workspaces = distinct_workspaces(&connection, 2);
+        let (source, target) = (workspaces[0].handle.clone(), workspaces[1].handle.clone());
+        assert_ne!(source.id(), target.id());
+        let toplevel = |app_id: &str, workspace: &ExtWorkspaceHandleV1| ToplevelInfo {
+            title: app_id.into(),
+            app_id: app_id.into(),
+            identifier: app_id.into(),
+            state: HashSet::new(),
+            output: HashSet::new(),
+            geometry: HashMap::new(),
+            workspace: HashSet::from([workspace.clone()]),
+            cosmic_toplevel: None,
+            foreign_toplevel: ExtForeignToplevelHandleV1::inert(connection.backend().downgrade()),
+        };
+        let mut toplevels = vec![toplevel("a", &source)];
+        toplevels.extend(target_apps.iter().map(|app_id| toplevel(app_id, &target)));
+        let _ = cosmic::Application::update(
+            &mut app,
+            Message::WorkspaceUpdate(WorkspacesUpdate::Snapshot(WorkspaceSnapshot {
+                workspaces: workspaces.clone(),
+                toplevels,
+                output: None,
+            })),
+        );
+        let icon = |workspace: &ExtWorkspaceHandleV1| AppIconId {
+            workspace: workspace.id(),
+            app_id: "a".into(),
+            window: None,
+        };
+        let context = format!("target with {target_apps:?}");
+
+        let _ = cosmic::Application::update(&mut app, Message::IconDragStarted(icon(&source)));
+        assert!(app.icon_growths.is_empty(), "{context}");
+        let _ = cosmic::Application::update(&mut app, Message::DropTargetEntered(target.id()));
+        assert!(
+            app.icon_growths.contains_key(&icon(&target)),
+            "the preview grows in: {context}"
+        );
+        assert!(app.icon_flights.is_empty(), "nothing flies: {context}");
+        assert!(app.animating(), "{context}");
+        let opens_a_slot = app
+            .icon_arrivals
+            .iter()
+            .any(|arrival| arrival.id == icon(&target));
+        assert_eq!(
+            opens_a_slot,
+            !target_apps.is_empty(),
+            "only a pill with icons to keep in place opens a slot: {context}"
+        );
+
+        if target_apps.is_empty() {
+            // The rectangle tracker reports where the preview is drawn.
+            let size = app.app_icon_size();
+            app.icon_rectangles.insert(
+                icon(&target),
+                Rectangle::new(Point::new(60.0, 4.0), Size::new(size, size)),
+            );
+            let _ = cosmic::Application::update(&mut app, Message::DropTargetLeft(target.id()));
+            let [shrink] = app.icon_shrinks.as_slice() else {
+                panic!("the preview shrinks away: {context}");
+            };
+            assert_eq!(shrink.icon.id, icon(&target));
+            assert!(
+                shrink.from.opacity < 1.0 && shrink.from.scale < 1.0,
+                "it shrinks from its partly grown size: {context}"
+            );
+        }
+    }
 }
 
 /// While the gap of an icon that left its pill closes, the icons kept there

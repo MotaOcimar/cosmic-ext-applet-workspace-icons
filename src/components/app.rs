@@ -826,6 +826,9 @@ struct IconShrink {
     /// The pill's size when the icon left. The icon moves with the pill's end
     /// while the pill shrinks, so it stays inside.
     pill_size: f32,
+    /// How much of the icon showed when it left: less than full when it had
+    /// not finished growing in, as when a drag only passes over a pill.
+    from: IconReveal,
     progress: Animation<bool>,
 }
 
@@ -849,6 +852,15 @@ impl IconReveal {
         Self {
             opacity: progress,
             scale: start_scale + (1.0 - start_scale) * progress,
+        }
+    }
+
+    /// This look `progress` of the way from gone (0) to itself (1), shrunk
+    /// and faded together.
+    fn partial(self, progress: f32) -> Self {
+        Self {
+            opacity: self.opacity * progress,
+            scale: self.scale * progress,
         }
     }
 }
@@ -1968,13 +1980,16 @@ impl IcedWorkspacesApplet {
                 Layout::Row => (shrink.at.x - behind, shrink.at.y),
                 Layout::Column => (shrink.at.x, shrink.at.y - behind),
             };
+            let reveal = shrink
+                .from
+                .partial(shrink.progress.interpolate(1.0, 0.0, self.now));
             let icon = container(self.app_icon(
                 &shrink.icon.metadata,
                 icon_size,
                 shrink.icon.dimmed,
                 false,
                 icon_size,
-                IconReveal::growing(shrink.progress.interpolate(1.0, 0.0, self.now), 0.0),
+                reveal,
             ))
             .width(Length::Fixed(shrink.at.width))
             .height(Length::Fixed(shrink.at.height))
@@ -2124,6 +2139,7 @@ impl IcedWorkspacesApplet {
             return;
         };
         let now = Instant::now();
+        self.now = now;
         let pill_size = self
             .pill_sizes
             .get(workspace)
@@ -2133,12 +2149,12 @@ impl IcedWorkspacesApplet {
             icon: icon.clone(),
             at,
             pill_size,
+            from: self.icon_reveal(&icon.id),
             progress: Animation::new(false)
                 .duration(ICON_ANIMATION)
                 .easing(Easing::EaseInOutCubic)
                 .go(true, now),
         });
-        self.now = now;
     }
 
     /// Puts the spacing between the elements of a pill's icon strip, and the
@@ -4762,7 +4778,15 @@ impl cosmic::Application for IcedWorkspacesApplet {
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         let drawn_before = self.drawn_pill_icons();
+        let shown_before = self.shown_icon_ids();
+        let preview_before = self.drop_preview_workspace();
         let task = self.handle_message(message);
+        // An icon dragged over a pill grows in there like a new one. No window
+        // moved, so none of them flies.
+        if self.drop_preview_workspace() != preview_before {
+            let placements = self.window_placements();
+            self.animate_new_icons(&shown_before, &placements);
+        }
         self.animate_pill_sizes();
         self.animate_pill_highlights();
         let drawn_after = self.drawn_pill_icons();
